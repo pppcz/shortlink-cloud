@@ -40,6 +40,30 @@ org.springframework.data:spring-data-redis       ❌
 在本沙箱内**均无法执行**。仓库代码按任务书指定的技术栈如实编写，
 由使用者在具备网络与 Docker 的机器上执行验收。
 
+### 关于推送到 GitHub（补充实测）
+
+本项目当前**只存在于本地仓库**，没有任何 remote：
+
+```
+$ git remote -v          # 输出为空
+```
+
+尝试推送到 GitHub 时实测到以下阻断，因此**代码尚未上传到任何远端**：
+
+| 检查 | 实测结果 |
+| --- | --- |
+| `Get-Command gh` | MISSING —— 未安装 GitHub CLI，无法用 CLI 建仓 |
+| `git ls-remote https://github.com/octocat/Hello-World` | `Failed to connect to github.com:443 after 21088 ms: Could not connect to server` |
+| TCP 443 连通性 | `Test-NetConnection github.com -Port 443` → True（TCP 能连，但 TLS/应用层被阻断） |
+| SSH 方式（`git@github.com:...`） | `sh.exe: *** fatal error - couldn't create signal pipe, Win32 error 5` —— 沙箱禁止创建命名管道，git 无法启动 ssh 子进程 |
+| `~/.git-credentials` | 不存在 |
+| `~/.ssh` 下的私钥 | 不存在（只有 `known_hosts`） |
+| HTTPS 代理 | 未配置 |
+
+结论：**既无法建仓，也无法认证，更无法建立到 GitHub 的可用连接。**
+本仓库已通过 `git bundle` 导出为单文件（见 `docs/github-push.md`），
+使用者可在有网络的机器上一条命令推送。
+
 ---
 
 ## 阶段 0：仓库初始化
