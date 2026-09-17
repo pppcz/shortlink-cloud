@@ -1,0 +1,34 @@
+# =====================================================================
+# 生产 / 容器环境 profile（docker compose 使用）
+# 所有连接信息均来自环境变量，禁止在此写死密钥。
+# =====================================================================
+spring:
+  datasource:
+    hikari:
+      minimum-idle: 20
+      maximum-pool-size: 80
+
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+logging:
+  level:
+    root: WARN
+    com.shortlink.cloud: INFO
+  file:
+    name: /app/logs/shortlink-cloud.log
+  logback:
+    rollingpolicy:
+      max-file-size: 100MB
+      max-history: 7
+      total-size-cap: 2GB
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+
+springdoc:
+  swagger-ui:
+    # 生产也可访问（验收要求 Swagger 可访问）；如需关闭改为 false
+    enabled: true
+  api-docs:
+    enabled: true

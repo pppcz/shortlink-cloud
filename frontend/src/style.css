@@ -1,0 +1,40 @@
+:root {
+  --sl-primary: #409eff;
+  --sl-header-height: 60px;
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #303133;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: #f5f7fa;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+.text-muted {
+  color: #909399;
+}
+
+.page-container {
+  padding: 16px;
+}
+
+.card-gap {
+  margin-bottom: 16px;
+}

@@ -1,0 +1,64 @@
+# ---------------- Java / Maven ----------------
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+.mvn/repository/
+.mvn/wrapper/maven-wrapper.properties.bak
+
+# ---------------- IDE ----------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+!.vscode/extensions.json
+.settings/
+.project
+.classpath
+.factorypath
+*.swp
+
+# ---------------- Node / 前端 ----------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ---------------- 运行期数据 ----------------
+logs/
+*.log
+volumes/
+data/
+docker/volumes/
+
+# ---------------- 环境变量 ----------------
+.env
+.env.local
+.env.*.local
+!.env.example
+# 前端构建期变量不含密钥，随仓库提交（Nginx 反代用相对路径）
+!frontend/.env.development
+!frontend/.env.production
+
+# ---------------- 压测产物 ----------------
+loadtest/results/
+loadtest/reports/
+*.jtl
+jmeter.log
+
+# ---------------- 操作系统 ----------------
+.DS_Store
+Thumbs.db
+desktop.ini

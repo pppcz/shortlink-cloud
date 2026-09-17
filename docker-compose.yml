@@ -1,0 +1,183 @@
+# =====================================================================
+# shortlink-cloud 一键启动编排
+#   docker compose up -d            仅启动中间件 (mysql/redis/rabbitmq)
+#   docker compose up -d --build    启动全部服务（含 backend / nginx 前端）
+#   docker compose ps               查看状态
+# 变量全部来自 .env（可从 .env.example 复制）
+# =====================================================================
+name: shortlink-cloud
+
+services:
+  # ------------------------------------------------------------------
+  # MySQL 8
+  # ------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0.39
+    container_name: shortlink-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-shortlink}
+      MYSQL_USER: ${MYSQL_USER:-shortlink}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-shortlink123}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+      - --max-connections=1000
+      - --innodb-buffer-pool-size=512M
+      - --innodb-flush-log-at-trx-commit=2
+      - --sync-binlog=0
+      - --skip-log-bin
+    ports:
+      - "${MYSQL_HOST_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - shortlink-net
+
+  # ------------------------------------------------------------------
+  # Redis 7（开启 AOF，保证限流/计数器不丢）
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7.2.5-alpine
+    container_name: shortlink-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:-redis123}
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis123}", "--no-auth-warning", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - shortlink-net
+
+  # ------------------------------------------------------------------
+  # RabbitMQ 3.13（管理台 http://localhost:15672）
+  # ------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13.7-management-alpine
+    container_name: shortlink-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-shortlink}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-shortlink123}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    ports:
+      - "${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_HOST_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - shortlink-net
+
+  # ------------------------------------------------------------------
+  # 后端 Spring Boot（profile=prod，Flyway 自动建表）
+  # ------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: shortlink-cloud/backend:latest
+    container_name: shortlink-backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-shortlink}
+      MYSQL_USER: ${MYSQL_USER:-shortlink}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-shortlink123}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis123}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-shortlink}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-shortlink123}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+      JWT_SECRET: ${JWT_SECRET:-shortlink-cloud-jwt-secret-please-change-me-in-production}
+      SHORTLINK_DOMAIN: ${SHORTLINK_DOMAIN:-http://localhost}
+      TZ: Asia/Shanghai
+      JAVA_OPTS: "-Xms512m -Xmx1024m -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - shortlink-net
+
+  # ------------------------------------------------------------------
+  # 前端 Nginx（静态资源 + /api 反向代理到 backend）
+  # ------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    image: shortlink-cloud/frontend:latest
+    container_name: shortlink-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_UPSTREAM: backend:8080
+    ports:
+      - "80:80"
+    networks:
+      - shortlink-net
+
+volumes:
+  mysql-data:
+    name: shortlink-mysql-data
+  redis-data:
+    name: shortlink-redis-data
+  rabbitmq-data:
+    name: shortlink-rabbitmq-data
+
+networks:
+  shortlink-net:
+    name: shortlink-net
+    driver: bridge

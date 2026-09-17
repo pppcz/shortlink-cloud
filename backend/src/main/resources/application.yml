@@ -1,0 +1,184 @@
+# =====================================================================
+# shortlink-cloud 后端配置
+# 环境变量前缀占位符与 .env.example 保持一致，容器内由 compose 注入。
+# =====================================================================
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  tomcat:
+    # 高并发跳转场景：加大工作线程与 backlog
+    threads:
+      max: 400
+      min-spare: 40
+    accept-count: 1000
+    max-connections: 20000
+  compression:
+    enabled: true
+    mime-types: application/json,text/html,text/plain
+    min-response-size: 1024
+
+spring:
+  application:
+    name: shortlink-cloud
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+# ---------------- 数据源 ----------------
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:shortlink}?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    username: ${MYSQL_USER:shortlink}
+    password: ${MYSQL_PASSWORD:shortlink123}
+    hikari:
+      minimum-idle: 10
+      maximum-pool-size: 50
+      idle-timeout: 300000
+      max-lifetime: 1200000
+      connection-timeout: 10000
+      pool-name: ShortLinkHikariPool
+
+# ---------------- Flyway ----------------
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    baseline-version: 0
+    validate-on-migrate: true
+    table: flyway_schema_history
+    encoding: UTF-8
+
+# ---------------- Redis ----------------
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:redis123}
+      database: ${REDIS_DATABASE:0}
+      timeout: 2000ms
+      connect-timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 200
+          max-idle: 50
+          min-idle: 20
+          max-wait: 1000ms
+        shutdown-timeout: 200ms
+
+# ---------------- RabbitMQ ----------------
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:shortlink}
+    password: ${RABBITMQ_PASSWORD:shortlink123}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    connection-timeout: 5000
+    requested-heartbeat: 30
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+      retry:
+        enabled: true
+        initial-interval: 200ms
+        max-attempts: 3
+        multiplier: 2
+    listener:
+      simple:
+        acknowledge-mode: manual
+        prefetch: 50
+        concurrency: 4
+        max-concurrency: 16
+        retry:
+          enabled: true
+          initial-interval: 500ms
+          max-attempts: 3
+          multiplier: 2
+
+# ---------------- MyBatis-Plus ----------------
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.shortlink.cloud.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    cache-enabled: false
+  global-config:
+    banner: false
+    db-config:
+      id-type: assign_id
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+      table-underline: true
+
+# ---------------- Redisson ----------------
+redisson:
+  enabled: true
+  single-server-config:
+    address: redis://${REDIS_HOST:localhost}:${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:redis123}
+    database: ${REDIS_DATABASE:0}
+    connection-minimum-idle-size: 10
+    connection-pool-size: 64
+    timeout: 3000
+    retry-attempts: 3
+
+# ---------------- 业务配置 ----------------
+shortlink:
+  # 短链域名前缀，用于返回给前端的完整短链
+  domain: ${SHORTLINK_DOMAIN:http://localhost:8080}
+  # 短码长度
+  code-length: 7
+  # 缓存
+  cache:
+    # 正常映射缓存时间（秒）
+    link-ttl-seconds: 3600
+    # 空值缓存时间（秒），防缓存穿透
+    null-ttl-seconds: 60
+    # TTL 随机抖动比例（0.2 表示 ±20%），防缓存雪崩
+    ttl-jitter-ratio: 0.2
+    # 布隆过滤器预期容量与误判率
+    bloom-expected-insertions: 10000000
+    bloom-false-positive-probability: 0.001
+  # 限流
+  rate-limit:
+    # 单 IP 每秒允许的跳转请求数
+    redirect-permit-per-second: ${RATE_LIMIT_PERMIT_PER_SECOND:50}
+    # 单 IP 每天允许创建的短链数
+    create-per-day: ${RATE_LIMIT_CREATE_PER_DAY:200}
+  # JWT
+  jwt:
+    secret: ${JWT_SECRET:shortlink-cloud-jwt-secret-please-change-me-in-production}
+    expire-seconds: ${JWT_EXPIRE_SECONDS:86400}
+    header: Authorization
+    prefix: "Bearer "
+
+# ---------------- 监控 ----------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+
+# ---------------- 接口文档 ----------------
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+  default-produces-media-type: application/json
+
+logging:
+  level:
+    root: INFO
+    com.shortlink.cloud: INFO
