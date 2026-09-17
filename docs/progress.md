@@ -333,7 +333,91 @@ curl localhost:8080/api/stats/trend            # ❌ 未执行
 
 ## 阶段 4：前端、Docker、压测、README
 
-**状态**：待开始
+**状态**：✅ 代码完成（构建、镜像、压测均无法在本沙箱执行）
+
+### 交付物
+
+| 文件 | 说明 |
+| --- | --- |
+| `frontend/src/api/{http,link,stats,auth}.ts` | axios 封装（JWT 注入、统一解包 Result、401/429 处理）与接口定义 |
+| `frontend/src/store/auth.ts` | Pinia 登录状态（token 持久化 + 刷新后拉取用户） |
+| `frontend/src/router/index.ts` | 路由表 + 全局守卫（未登录跳登录，已登录不进登录页） |
+| `frontend/src/layout/AdminLayout.vue` | 侧边栏 + 顶栏 + 退出登录 |
+| `frontend/src/components/ChartPanel.vue` | ECharts 封装（响应式、resize、loading、卸载 dispose） |
+| `frontend/src/views/LoginView.vue` | 登录页（表单校验、默认账号提示） |
+| `frontend/src/views/DashboardView.vue` | 概览：4 个指标卡 + 趋势折线 + 最近创建 |
+| `frontend/src/views/LinkListView.vue` | 短链管理：检索、分页、创建弹窗、复制、禁用、跳统计 |
+| `frontend/src/views/StatsView.vue` | 统计：指标卡 + PV/UV 折线 + 每日柱状 + 明细表 |
+| `frontend/src/views/NotFoundView.vue` | 404 页 |
+| `frontend/Dockerfile` + `frontend/nginx/default.conf` | 多阶段构建 + SPA 回退 + /api 反代 + 静态资源长缓存 |
+| `backend/Dockerfile` | 多阶段构建 + Spring Boot 分层 + 非 root 运行 |
+| `loadtest/wrk/redirect.sh` | wrk 压测脚本（含预热与结果落盘） |
+| `loadtest/jmeter/shortlink-redirect.jmx` | JMeter 压测计划（参数化 host/port/code/threads/duration） |
+| `loadtest/postman/*.json` | Postman 集合（登录自动写 token、创建自动写 shortCode） |
+| `docs/benchmark.md` | 压测方法论、采集口径、实测表格（留空待填） |
+| `README.md` | 架构图、一键启动、接口一览、冒烟脚本、压测说明、诚实声明 |
+
+### 前端关键实现点
+
+1. **token 存 localStorage，用户信息不存**：刷新后通过 `/api/auth/me` 重新拉取，
+   这样后台改了用户信息能及时反映，也避免把过期身份缓存在本地。
+2. **axios 响应拦截器统一解包 `Result`**：非 0 业务码直接 reject 并弹提示，
+   页面里只处理成功分支，减少重复代码。
+3. **ECharts 用 `shallowRef` 持有**：ECharts 实例是庞大的非响应式对象，
+   用 `ref` 会带来无谓的深度代理开销；同时在 `onBeforeUnmount` 里 `dispose` 防内存泄漏。
+4. **复制短链做降级**：`navigator.clipboard` 在非 HTTPS 或旧浏览器不可用，
+   降级到 `document.execCommand('copy')`，再失败则提示手动复制。
+5. **`index.html` 不缓存、`/assets/*` 长缓存**：Vite 产物带内容 hash，
+   壳子不缓存才能保证发版后用户立刻拿到新版本。
+
+### 部署关键实现点
+
+1. **后端镜像用 Spring Boot 分层 `layertools`**：依赖层变化频率低，
+   放在镜像层前面，代码改动时不必重传全部依赖。
+2. **容器内非 root 运行**：`useradd -r shortlink` + `chown`，
+   降低容器逃逸后的影响面。
+3. **Nginx 透传 `X-RateLimit-*` 与 `Retry-After`**：否则前端读不到剩余配额。
+4. **Nginx `try_files ... /index.html`**：history 路由模式下刷新子页面不会 404。
+5. **`/actuator/` 限制来源网段**：避免健康与指标端点暴露到公网。
+
+### 验收命令结果
+
+```bash
+docker compose up -d --build     # ❌ 未执行：docker 未安装
+npm run build                    # ❌ 未执行：npm 依赖无法下载（ENOTCACHED）
+# 浏览器访问前端，创建短链，查看统计   # ❌ 未执行：前端构建产物与后端服务都不存在
+```
+
+❌ **全部未执行**，原因同前。前端 `npm run build` 会先跑 `vue-tsc -b` 类型检查，
+因此**我无法保证前端 TypeScript 零类型错误**——这是本阶段最大的未验证风险点。
+为降低风险，代码中刻意避免了容易踩的类型陷阱：
+
+| 易错点 | 处理方式 |
+| --- | --- |
+| `noUnusedLocals`/`noUnusedParameters` 为 true，未用变量会直接构建失败 | 逐文件检查，未使用的 `props` 变量已移除或实际使用 |
+| ECharts option 需要 `EChartsOption` 类型 | 计算属性显式标注 `computed<EChartsOption>(...)` |
+| axios 泛型返回 | 统一 `http.get<ApiResult<T>>` 并取 `data.data` |
+| `import type` 与值导入混用（`verbatimModuleSyntax`） | 所有纯类型导入均使用 `import type` |
+| Element Plus 组件 props | 用官方签名（`v-model:current-page`、`el-radio-button :value`） |
+
+### 静态校验
+
+| 检查项 | 结果 |
+| --- | --- |
+| `docker-compose.yml` 中 backend/frontend 的 `build.context` 与实际目录一致 | ✅ `./backend`、`./frontend` |
+| `frontend/Dockerfile` 期望的 `nginx/default.conf` 路径存在 | ✅ 已创建 |
+| 后端 Dockerfile 的 jar 名与 `pom.xml` 的 `finalName` 一致 | ✅ 均为 `shortlink-cloud-backend` |
+| `FRONTEND` 健康检查路径 `/healthz` 在 Nginx 配置中有对应 location | ✅ |
+| 前端路由路径与后端接口路径前缀一致（`VITE_API_BASE_URL=/api`） | ✅ |
+| Postman 集合 JSON 可被解析 | ✅ `json.load` 通过 |
+| JMeter jmx XML 结构完整（TestPlan → ThreadGroup → HTTPSamplerProxy → Assertion） | ✅ |
+| `loadtest/wrk/redirect.sh` 输出文件目录会被创建（`mkdir -p`） | ✅ |
+
+### 测试清单（已编写，未执行）
+
+前端**没有编写自动化测试**——本阶段未引入 Vitest，属于明确的范围取舍：
+任务书要求的是「ECharts 展示 PV/UV/趋势」的可视化界面，没有要求前端测试。
+后端的 8 个测试类覆盖了核心逻辑，前端以静态类型检查作为质量门禁。
 
 ---
 
@@ -342,12 +426,48 @@ curl localhost:8080/api/stats/trend            # ❌ 未执行
 | 任务书中的验收动作 | 能否在本沙箱验证 | 原因 |
 | --- | --- | --- |
 | `mvn -q -DskipTests package` | ❌ | 依赖无法下载 + 本地仓库不可写 |
-| `mvn test` | ❌ | 同上 |
+| `mvn test` | ❌ | 同上。**8 个测试类均未执行过，不能声称通过** |
 | `docker compose up -d` / `ps` / `--build` | ❌ | 未安装 Docker |
 | `curl` 本地接口 | ❌ | 后端无法启动 |
-| `npm run build` | ❌ | npm 无法安装依赖 |
+| `npm run build` | ❌ | npm 无法安装依赖（ENOTCACHED） |
+| 前端 TypeScript 类型检查 | ❌ | 同上，`vue-tsc` 无法运行 |
 | `wrk` QPS / P99 压测 | ❌ | 无后端、无 wrk、无 Docker |
 | 真实 MySQL / Redis / RabbitMQ 联调 | ❌ | 中间件无法启动 |
-| **Java 源码、SQL、Vue 源码、配置的静态审查** | ✅ | 逐文件校验完成，结果见各阶段小节 |
+| Java 源码、SQL、Vue 源码、配置的静态审查 | ✅ | 逐文件复核，结果见各阶段小节 |
+| Postman 集合 JSON 可解析 | ✅ | `json.load` 通过 |
 
-后续阶段的验收小节将保持同样的诚实标准。
+### 与任务书的技术选型偏差（全部如实列出）
+
+| 项目 | 任务书 | 实际 | 理由 |
+| --- | --- | --- | --- |
+| Spring Boot 版本 | 3.3 | 3.3.4 | 取 3.3.x 最新补丁版 |
+| 密码存储 | 未指定算法 | **PBKDF2-HMAC-SHA256（210000 次迭代）** | bcrypt 的种子哈希在离线环境下无法验证正确性；PBKDF2 由 JDK 原生提供（零外部依赖），且本仓库已用等价 Python 实现复现完全相同的字节并交叉验证。**这是本项目唯一一处偏离常规做法的选型**，相关测试 `Pbkdf2PasswordEncoderTest#shouldVerifySeedAdminHash` 校验了写死在 V3 前的种子哈希 |
+| Redisson 依赖 | `redisson-spring-boot-starter` | `redisson`（手动声明 `RedissonClient`） | starter 会带入与其绑定的 `spring-data-redis` 版本，可能与 Spring Boot 管理的版本冲突 |
+| 压测工具 | JMeter 或 wrk | 两个都提供 | 任务书写「或」，两者都给可以覆盖 Windows/Linux |
+| 前端脚手架 | `npm create vite@latest` | 手写等价产出 | 脚手架需要联网，沙箱无出网；已按该模板的标准文件集合与依赖版本手写 |
+
+### 建议的验证顺序（在有 Docker 与网络的机器上）
+
+```bash
+# 1. 先验证后端能编译、测试能过 —— 这一步会暴露最多问题
+cd backend && mvn -DskipTests package && mvn test
+
+# 2. 再验证前端类型检查与构建
+cd ../frontend && npm install && npm run build
+
+# 3. 最后起服务做端到端冒烟
+cd .. && cp .env.example .env && docker compose up -d --build && docker compose ps
+#    然后执行 README「冒烟测试」一节的三条命令
+
+# 4. 一切正常后再跑压测，把结果填进 docs/benchmark.md §4
+```
+
+**最可能出问题的地方**（按概率排序，供排查参考）：
+
+1. **前端 `vue-tsc` 类型错误**——完全没跑过类型检查，是最大的未知项。
+2. **`mvn test` 断言与实际行为不一致**——测试是按设计意图写的，但没执行过。
+3. **Redisson `RScript.evalSha` 签名**与 3.32.0 实际 API 有出入。
+4. **MyBatis-Plus 对 `@Select` 文本块（Java 15+ text block）的支持**——
+   理论上 MyBatis 3.5.16 会原样传递 SQL 字符串，但未实测。
+5. **jackson 反序列化 `LocalDateTime`** 到缓存实体时区问题——
+   `application.yml` 已配 `time-zone: Asia/Shanghai`，但未实测。

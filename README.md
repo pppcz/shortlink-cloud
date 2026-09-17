@@ -40,38 +40,43 @@
         │  └──────┬───────┘   └───────┬───────┘   └────────────┬─────────────┘   │
         │         │                   │                        │                 │
         │  ┌──────▼───────────────────▼────────────────────────▼─────────────┐   │
-        │  │                    业务层 Service                              │   │
-        │  │  ShortLinkService · StatsService · AuthService                 │   │
-        │  └──────┬───────────────┬────────────────┬───────────────┬────────┘   │
-        │         │               │                │               │            │
+        │  │   限流拦截器 (Redis+Lua，IP 维度) · Sentinel 接口级 QPS 兜底      │   │
+        │  └──────────────────────────┬──────────────────────────────────────┘   │
+        │  ┌──────────────────────────▼──────────────────────────────────────┐   │
+        │  │                    业务层 Service                               │   │
+        │  │  ShortLinkService · StatsService · AuthService                  │   │
+        │  └──────┬───────────────┬────────────────┬───────────────┬─────────┘   │
+        │         │               │                │               │             │
         │  ┌──────▼─────┐  ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼─────────┐  │
-        │  │ Redis 缓存  │  │ 布隆过滤器   │  │ Lua 限流     │  │ MQ 生产者      │  │
-        │  │ 空值+抖动   │  │ Redisson    │  │ IP + 接口    │  │ 访问日志       │  │
+        │  │ Redis 缓存  │  │ 布隆过滤器   │  │ Redis 发号   │  │ MQ 生产者      │  │
+        │  │ 空值+抖动   │  │ Redisson    │  │ INCR+Base62 │  │ 访问日志       │  │
         │  └──────┬─────┘  └──────┬──────┘  └──────┬──────┘  └─────┬─────────┘  │
         └─────────┼───────────────┼────────────────┼───────────────┼────────────┘
                   │               │                │               │
         ┌─────────▼───────────────▼────────────────▼───┐   ┌───────▼─────────────┐
         │              Redis 7 (:6379)                 │   │  RabbitMQ (:5672)   │
-        │  url 缓存 · 布隆位图 · 限流计数器 · 发号器    │   │  link.access.log    │
-        └──────────────────────────────────────────────┘   │  → 消费者批量落库    │
+        │  url 缓存 · 布隆位图 · 限流计数 · 发号器      │   │  link.access        │
+        └──────────────────────────────────────────────┘   │  → 消费者攒批 500/2s │
                                                            └───────┬─────────────┘
         ┌──────────────────────────────────────────────────────────▼─────────────┐
         │                            MySQL 8 (:3306)                             │
-        │  t_user · t_short_link · t_link_access_log · t_link_stats              │
+        │  t_user · t_short_link · t_link_access_log · t_link_stats · t_link_uv_log│
         └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 高并发设计要点
 
-| 关注点 | 方案 |
-| --- | --- |
-| 缓存穿透 | Redisson 布隆过滤器预判 + 空值缓存（短 TTL） |
-| 缓存击穿 | 热点 key 逻辑过期 / 互斥重建（Redisson 分布式锁） |
-| 缓存雪崩 | TTL 随机抖动（±20%） |
-| 写扩散 / 发号 | Redis `INCR` + Base62，冲突则二次重试；DB 唯一索引兜底 |
-| 限流 | Redis + Lua 原子滑动窗口（IP 维度），Sentinel 兜底 |
-| 统计削峰 | 跳转接口只投递 MQ 消息，消费者批量写日志与聚合表 |
-| 跳转响应 | 302/301 重定向，全程无阻塞 DB 查询（命中缓存时） |
+| 关注点 | 方案 | 代码位置 |
+| --- | --- | --- |
+| 缓存穿透 | Redisson 布隆过滤器预判（一定不存在直接 404）+ 空值缓存（短 TTL） | `ShortLinkCacheManager` |
+| 缓存击穿 | 缓存 TTL 取 `min(1h, 距短链过期秒数)`，避免大量 key 同时失效 | `ShortLinkCacheManagerImpl#ttlFor` |
+| 缓存雪崩 | TTL 随机抖动 ±20% | `ShortLinkCacheManagerImpl#jitter` |
+| 缓存一致性 | 禁用短链时主动失效缓存 | `ShortLinkServiceImpl#disable` |
+| 发号 | Redis `INCR`（按天分 key）+ Base62；DB 唯一索引 + 5 次重试兜底 | `RedisSeqShortCodeGenerator` |
+| 限流 | Redis + Lua 原子固定窗口（IP 维度）+ 单日创建量限制 + Sentinel 接口级兜底 | `RateLimitInterceptor` / `SentinelConfig` |
+| 统计削峰 | 跳转只投 MQ；消费者内存攒批 500 条 / 2 秒，**刷盘成功才 ack** | `LinkAccessConsumer` |
+| 跳转响应 | 302 + `no-store`，命中缓存时全程无 DB 访问 | `RedirectController` |
+| 降级 | 缓存/布隆过滤器故障 → 回源 DB；限流故障 → fail-open；MQ 故障 → 丢统计不丢跳转 | 各组件 try/catch |
 
 ---
 
@@ -80,7 +85,7 @@
 ### 前置要求
 
 - Docker 24+ 与 Docker Compose v2
-- 本机 8080 / 80 / 3306 / 6379 / 5672 / 15672 端口未被占用
+- 8080 / 80 / 3306 / 6379 / 5672 / 15672 端口未被占用
 - （可选，本地裸机开发）JDK 17、Maven 3.9+、Node 18+
 
 ### 一键启动（推荐）
@@ -92,21 +97,22 @@ cp .env.example .env
 # 2. 启动全部服务（MySQL / Redis / RabbitMQ / 后端 / 前端）
 docker compose up -d --build
 
-# 3. 查看状态
+# 3. 查看状态（等所有服务 healthy）
 docker compose ps
 ```
 
 启动完成后：
 
-| 入口 | 地址 |
-| --- | --- |
-| 管理后台 | http://localhost |
-| 后端 API | http://localhost:8080 |
-| Swagger UI | http://localhost:8080/swagger-ui.html |
-| RabbitMQ 管理台 | http://localhost:15672 （shortlink / shortlink123） |
-| 健康检查 | http://localhost:8080/actuator/health |
+| 入口 | 地址 | 凭据 |
+| --- | --- | --- |
+| 管理后台 | http://localhost | `admin` / `admin123` |
+| 后端 API | http://localhost:8080 | — |
+| Swagger UI | http://localhost:8080/swagger-ui.html | — |
+| RabbitMQ 管理台 | http://localhost:15672 | `shortlink` / `shortlink123` |
+| 健康检查 | http://localhost:8080/actuator/health | — |
 
-> 默认管理员账号见 `README` 的[接口一览](#接口一览) 或 Flyway `V3__seed_admin_user.sql`。
+> ⚠️ `admin / admin123` 由 Flyway `V2__seed_admin_user.sql` 写入，**生产环境请立即修改**。
+> 密码使用 PBKDF2-HMAC-SHA256（210000 次迭代）存储，不是明文，也不是 bcrypt（选型理由见 `docs/progress.md`）。
 
 ### 仅启动中间件 + 本地 IDE 调试
 
@@ -121,6 +127,28 @@ mvn spring-boot:run -Dspring-boot.run.profiles=dev
 cd frontend
 npm install
 npm run dev     # http://localhost:5173
+```
+
+### 冒烟测试（一条命令验证全链路）
+
+```bash
+# 1. 创建短链
+CODE=$(curl -s -X POST http://localhost:8080/api/link/create \
+  -H 'Content-Type: application/json' \
+  -d '{"originalUrl":"https://example.com/hello","title":"冒烟"}' \
+  | grep -o '"shortCode":"[^"]*"' | cut -d'"' -f4)
+echo "shortCode=${CODE}"
+
+# 2. 跳转应返回 302 + Location
+curl -sI "http://localhost:8080/${CODE}" | head -3
+
+# 3. 等 2 秒让 MQ 消费者落库，再查统计
+sleep 3
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' \
+  | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+curl -s "http://localhost:8080/api/stats/${CODE}" -H "Authorization: Bearer ${TOKEN}"
 ```
 
 ### 常用运维命令
@@ -148,13 +176,14 @@ docker compose down -v              # 停止并清空数据
 }
 ```
 
-`code = 0` 表示成功，非 0 为业务错误码（见 `ErrorCode`）。
+`code = 0` 表示成功，非 0 为业务错误码（见 `ErrorCode`）：`1xxxx` 参数、`2xxxx` 资源、
+`3xxxx` 鉴权、`4xxxx` 限流、`5xxxx` 系统。
 
 ### 短链
 
 | 方法 | 路径 | 说明 | 鉴权 |
 | --- | --- | --- | --- |
-| `POST` | `/api/link/create` | 创建短链 | 可选 |
+| `POST` | `/api/link/create` | 创建短链（支持自定义短码 / 有效期） | 可选（匿名可创建） |
 | `GET` | `/{shortCode}` | 跳转（302） | 无 |
 | `GET` | `/api/link/page` | 分页查询短链 | 需要 |
 | `PUT` | `/api/link/disable/{id}` | 禁用短链 | 需要 |
@@ -163,8 +192,8 @@ docker compose down -v              # 停止并清空数据
 
 | 方法 | 路径 | 说明 | 鉴权 |
 | --- | --- | --- | --- |
-| `GET` | `/api/stats/{shortCode}` | 单条短链汇总统计 | 需要 |
-| `GET` | `/api/stats/trend` | 趋势（按天） | 需要 |
+| `GET` | `/api/stats/{shortCode}?days=7` | 单条短链汇总 + 按天趋势 | 需要 |
+| `GET` | `/api/stats/trend?days=7` | 趋势；不传 `shortCode` 时返回全部合计 | 需要 |
 
 ### 认证
 
@@ -176,22 +205,33 @@ docker compose down -v              # 停止并清空数据
 ### 示例
 
 ```bash
-# 创建短链
+# 创建短链（带有效期与自定义短码）
 curl -X POST http://localhost:8080/api/link/create \
   -H 'Content-Type: application/json' \
-  -d '{"originalUrl":"https://example.com/very/long/path","title":"示例"}'
+  -d '{"originalUrl":"https://example.com/very/long/path","title":"示例","expireDays":30,"customCode":"mysite"}'
 
 # 跳转（只看响应头）
-curl -I http://localhost:8080/{shortCode}
+curl -I http://localhost:8080/mysite
 
 # 分页查询
-curl 'http://localhost:8080/api/link/page?current=1&size=10' \
+curl 'http://localhost:8080/api/link/page?current=1&size=10&status=1' \
   -H "Authorization: Bearer $TOKEN"
 
-# 统计
-curl http://localhost:8080/api/stats/{shortCode} -H "Authorization: Bearer $TOKEN"
-curl 'http://localhost:8080/api/stats/trend?shortCode={shortCode}&days=7' -H "Authorization: Bearer $TOKEN"
+# 统计与趋势
+curl "http://localhost:8080/api/stats/mysite?days=7" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:8080/api/stats/trend?days=30" -H "Authorization: Bearer $TOKEN"
 ```
+
+### 跳转接口的响应头
+
+| 响应头 | 说明 |
+| --- | --- |
+| `Location` | 302 时的目标地址 |
+| `Cache-Control: no-store` | 禁止浏览器缓存跳转，保证统计真实 |
+| `X-RateLimit-Limit` / `X-RateLimit-Remaining` | 当前 IP 的配额与剩余 |
+| `Retry-After` | 被限流（429）时建议的重试间隔 |
+
+状态码约定：`302` 正常跳转 / `404` 短码不存在 / `410` 已禁用或已过期 / `429` 触发限流。
 
 ---
 
@@ -201,65 +241,78 @@ curl 'http://localhost:8080/api/stats/trend?shortCode={shortCode}&days=7' -H "Au
 shortlink-cloud/
 ├── backend/                     # Spring Boot 后端
 │   ├── src/main/java/com/shortlink/cloud/
-│   │   ├── common/              # 统一响应、异常、常量、工具
-│   │   ├── config/              # Redis / MQ / MyBatis-Plus / Redisson / Sentinel 配置
-│   │   ├── controller/          # REST 接口
-│   │   ├── dto/                 # 请求 / 响应对象
+│   │   ├── common/              # 统一响应、错误码、全局异常、traceId、用户上下文
+│   │   ├── config/              # Redis/Redisson · MQ · MyBatis-Plus · Sentinel · 鉴权与限流拦截器
+│   │   ├── controller/          # 跳转 / 短链 / 统计 / 认证
+│   │   ├── dto/                 # 请求与响应对象
 │   │   ├── entity/              # 数据库实体
 │   │   ├── mapper/              # MyBatis-Plus Mapper
-│   │   ├── mq/                  # 生产者 / 消费者 / 消息体
-│   │   ├── service/             # 业务逻辑
-│   │   └── util/                # Base62、IP、雪花等
+│   │   ├── mq/                  # 生产者 / 消费者 / 批量写入器 / 消息体
+│   │   ├── service/             # 业务逻辑（含缓存、限流、发号、统计实现）
+│   │   └── util/                # Base62 · URL 校验 · PBKDF2 · JWT · IP 工具
 │   ├── src/main/resources/
 │   │   ├── application*.yml     # 分环境配置
-│   │   ├── db/migration/        # Flyway 迁移脚本
-│   │   ├── lua/                 # Redis Lua 脚本
-│   │   └── mapper/              # MyBatis XML
+│   │   ├── db/migration/        # Flyway 迁移（V1 建表 / V2 管理员 / V3 统计）
+│   │   └── lua/                 # Redis Lua 脚本
+│   ├── src/test/java/           # 单元测试（8 个测试类）
 │   └── Dockerfile
 ├── frontend/                    # Vue3 + TS + Element Plus + ECharts
-│   ├── src/{api,router,store,views,components,layout,utils}
+│   ├── src/{api,components,layout,router,store,views}
 │   ├── nginx/default.conf
 │   └── Dockerfile
-├── docker/                      # 中间件初始化脚本
-├── loadtest/                    # wrk / JMeter 压测脚本
-├── docs/                        # 进度与压测报告
+├── docker/mysql/init/           # 中间件初始化脚本
+├── loadtest/                    # wrk / JMeter / Postman 压测与调试脚本
+├── docs/                        # progress.md（进度与验收）· benchmark.md（压测报告）
 ├── docker-compose.yml
 ├── .env.example
 └── README.md
 ```
 
+### 数据库表
+
+| 表 | 用途 |
+| --- | --- |
+| `t_user` | 平台用户（PBKDF2 密码、角色、状态） |
+| `t_short_link` | 短链映射（短码唯一、逻辑删除、PV/UV 冗余、过期时间） |
+| `t_link_access_log` | 访问明细（时间冗余出 `access_date` / `hour`，报表走索引） |
+| `t_link_stats` | 按天聚合（`(short_code, stat_date)` 唯一，幂等 upsert） |
+| `t_link_uv_log` | 每日 UV 去重（`(short_code, stat_date, ip_hash)` 唯一 + `INSERT IGNORE`） |
+
 ---
 
 ## 压测报告
 
-> 详细方法与原始数据见 [`docs/benchmark.md`](docs/benchmark.md)。
+> 方法论、采集口径与实测结果见 [`docs/benchmark.md`](docs/benchmark.md)。
 
-压测脚本位于 [`loadtest/`](loadtest/)：
+压测脚本：
 
 ```bash
-# wrk（推荐，Linux/macOS）
-wrk -t4 -c100 -d30s --latency http://localhost:8080/{shortCode}
+# wrk（Linux/macOS）
+./loadtest/wrk/redirect.sh ${SHORT_CODE} 30s 100 4
 
-# JMeter（跨平台）
+# JMeter（跨平台，Windows 也可用）
 jmeter -n -t loadtest/jmeter/shortlink-redirect.jmx \
-       -l loadtest/results/redirect.jtl \
-       -e -o loadtest/reports/redirect
+       -Jhost=localhost -Jport=8080 -Jcode=${SHORT_CODE} \
+       -Jthreads=100 -Jduration=30 \
+       -l loadtest/results/redirect.jtl -e -o loadtest/reports/redirect
 ```
 
-**目标值**：QPS 3000+ ，P99 < 50ms。
+**目标值**：QPS ≥ 3000，P99 < 50ms，错误率 < 0.1%，缓存命中率 ≥ 95%。
 
-**实测值**：见 [`docs/benchmark.md`](docs/benchmark.md)（含原始 wrk/JMeter 输出与运行环境）。
+**实测值**：**尚未测得**。本项目代码由 AI 在无 Docker、无 HTTPS 出网的沙箱中编写，
+`mvn package` / `docker compose up` / `wrk` 均无法执行，因此
+[`docs/benchmark.md`](docs/benchmark.md) 的 §4 实测表格留空——
+**不填任何推测数字**。请在有 Docker 与网络的环境按该文档 §3 执行后填入。
 
-> ⚠️ 诚实声明：本仓库的压测结论必须在具备 Docker 与网络的机器上实测后填入。
-> 本次交付所处的沙箱环境**无法运行 Docker、无法下载依赖、无 HTTPS 出网**，
-> 因此压测数据与构建结果均由使用者在本地复现，具体限制见 [`docs/progress.md`](docs/progress.md)。
+> ⚠️ 压测前请把 `.env` 中 `RATE_LIMIT_PERMIT_PER_SECOND` 调大，否则会被自己的限流挡住。
 
 ---
 
 ## 开发进度
 
-分阶段任务、验收命令与**真实执行结果**记录在 [`docs/progress.md`](docs/progress.md)，
-每个阶段的验收命令是否真的跑通、哪些跑不通、原因是什么，都在那里如实标注。
+分阶段任务、验收命令与**真实执行结果**记录在 [`docs/progress.md`](docs/progress.md)。
+每个阶段的验收命令是否真的跑通、哪些跑不通、原因是什么，都在那里如实标注，
+包括与任务书的技术选型偏差及其理由。
 
 ---
 
@@ -267,7 +320,9 @@ jmeter -n -t loadtest/jmeter/shortlink-redirect.jmx \
 
 - 默认端口：`80`(前端) / `8080`(后端) / `3306`(MySQL) / `6379`(Redis) / `5672`+`15672`(RabbitMQ)
 - 端口冲突时修改 `.env` 中对应的 `*_HOST_PORT`
-- 生产部署务必替换 `JWT_SECRET`、所有默认密码，并将 `springdoc.swagger-ui.enabled` 按需关闭
+- 生产部署必须替换：`JWT_SECRET`、MySQL/Redis/RabbitMQ 全部默认密码、
+  管理员初始密码；并按需关闭 `springdoc.swagger-ui.enabled`
+- 跳转统计由 MQ 异步写入，跳转后约 2 秒（消费者攒批周期）才能在统计接口看到数据
 
 ---
 
