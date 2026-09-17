@@ -29,6 +29,9 @@ import java.time.LocalDateTime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -60,6 +63,9 @@ class ShortLinkServiceImplTest {
     @Mock
     private ShortLinkCacheManager cacheManager;
 
+    @Mock
+    private com.shortlink.cloud.mq.LinkAccessProducer accessProducer;
+
     private ShortLinkServiceImpl service;
 
     @BeforeEach
@@ -68,7 +74,7 @@ class ShortLinkServiceImplTest {
         properties.setDomain(DOMAIN);
         LinkConverter converter = new LinkConverter(properties);
         service = new ShortLinkServiceImpl(shortLinkMapper, converter, redisCodeGenerator,
-                fallbackCodeGenerator, cacheManager);
+                fallbackCodeGenerator, cacheManager, accessProducer);
     }
 
     // ------------------------------------------------------------------
@@ -330,25 +336,37 @@ class ShortLinkServiceImplTest {
     }
 
     @Test
-    @DisplayName("命中短链时更新最近访问时间")
-    void shouldUpdateLastAccessOnHit() {
+    @DisplayName("命中短链时投递访问日志消息（不再同步写库）")
+    void shouldPublishAccessMessageOnHit() {
         when(cacheManager.mightContain("abc1234")).thenReturn(true);
         when(cacheManager.get("abc1234")).thenReturn(link(5L, "abc1234", 1, null));
-        when(shortLinkMapper.updateLastAccess(any(), any(LocalDateTime.class))).thenReturn(1);
 
-        service.resolve("abc1234", "1.2.3.4", "curl/8.0");
+        service.resolve("abc1234", "1.2.3.4", "curl/8.0", "https://ref.example");
 
-        verify(shortLinkMapper).updateLastAccess(any(), any(LocalDateTime.class));
+        verify(accessProducer).publish(any(ShortLink.class), eq("1.2.3.4"),
+                anyString(), eq("curl/8.0"), eq("https://ref.example"));
+        // 阶段 3 起跳转热路径不再直连数据库写统计
+        verify(shortLinkMapper, never()).updateLastAccess(any(), any(LocalDateTime.class));
     }
 
     @Test
-    @DisplayName("统计更新失败不影响跳转结果")
-    void shouldStillRedirectWhenStatsUpdateFails() {
+    @DisplayName("未命中或已失效的短链不投递访问日志")
+    void shouldNotPublishWhenNotRedirectable() {
+        when(cacheManager.mightContain("dis1234")).thenReturn(true);
+        when(cacheManager.get("dis1234")).thenReturn(link(2L, "dis1234", 0, null));
+
+        service.resolve("dis1234", "1.2.3.4", "curl/8.0");
+
+        verify(accessProducer, never()).publish(any(), anyString(), anyString(), any(), any());
+    }
+
+    @Test
+    @DisplayName("投递异常不影响跳转结果")
+    void shouldStillRedirectWhenPublishFails() {
         when(cacheManager.mightContain("ok12345")).thenReturn(true);
         when(cacheManager.get("ok12345")).thenReturn(link(4L, "ok12345", 1, null));
-        when(shortLinkMapper.updateLastAccess(any(), any(LocalDateTime.class)))
-                .thenThrow(new RuntimeException("db down"));
-
+        doThrow(new RuntimeException("mq down"))
+                .when(accessProducer).publish(any(), anyString(), anyString(), any(), any());
         RedirectResult result = service.resolve("ok12345", "1.2.3.4", "curl/8.0");
 
         assertThat(result.isFound()).isTrue();

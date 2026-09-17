@@ -90,8 +90,9 @@ public class RedirectController {
 
         String clientIp = IpUtils.getClientIp(request);
         String userAgent = request.getHeader(HttpHeaders.USER_AGENT);
+        String referer = request.getHeader(HttpHeaders.REFERER);
 
-        RedirectResult result = shortLinkService.resolve(shortCode, clientIp, userAgent);
+        RedirectResult result = shortLinkService.resolve(shortCode, clientIp, userAgent, referer);
         if (result.isFound()) {
             // 302 + no-store：既保证统计准确，也避免短链被浏览器长期缓存
             response.setStatus(HttpStatus.FOUND.value());

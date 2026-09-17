@@ -32,6 +32,17 @@ public interface ShortLinkService {
     RedirectResult resolve(String shortCode, String clientIp, String userAgent);
 
     /**
+     * 解析短码并返回跳转结果（带来源页）。
+     *
+     * @param shortCode 短码
+     * @param clientIp  访问者 IP
+     * @param userAgent User-Agent
+     * @param referer   来源页，可为 null
+     * @return 跳转结果，永不返回 null
+     */
+    RedirectResult resolve(String shortCode, String clientIp, String userAgent, String referer);
+
+    /**
      * 按 ID 禁用短链。
      *
      * @param id 短链 ID

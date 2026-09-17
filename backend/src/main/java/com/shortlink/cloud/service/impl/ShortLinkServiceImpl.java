@@ -9,12 +9,14 @@ import com.shortlink.cloud.dto.CreateLinkRequest;
 import com.shortlink.cloud.dto.CreateLinkResponse;
 import com.shortlink.cloud.entity.ShortLink;
 import com.shortlink.cloud.mapper.ShortLinkMapper;
+import com.shortlink.cloud.mq.LinkAccessProducer;
 import com.shortlink.cloud.service.LinkConverter;
 import com.shortlink.cloud.service.LocalSequenceShortCodeGenerator;
 import com.shortlink.cloud.service.RedirectResult;
 import com.shortlink.cloud.service.ShortCodeGenerator;
 import com.shortlink.cloud.service.ShortLinkCacheManager;
 import com.shortlink.cloud.service.ShortLinkService;
+import com.shortlink.cloud.util.IpHasher;
 import com.shortlink.cloud.util.UrlValidator;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -27,13 +29,17 @@ import java.util.regex.Pattern;
 /**
  * 短链服务实现。
  *
- * <p>跳转链路（阶段 2 起）：
+ * <p>跳转链路（阶段 3 起）：
  * <pre>
- *   布隆过滤器（一定不存在 → 直接 404，挡住绝大多数无效请求）
+ *   限流拦截器（IP 维度）
+ *        ↓
+ *   布隆过滤器（一定不存在 → 直接 404）
  *        ↓ 可能存在
- *   Redis 缓存（命中 → 直接 302；空值标记 → 直接 404）
+ *   Redis 缓存（命中 → 302；空值标记 → 404）
  *        ↓ 未命中
  *   MySQL 回源 → 回写缓存
+ *        ↓ 命中后
+ *   投递 MQ 访问日志（异步统计，失败不影响跳转）
  * </pre>
  *
  * @author shortlink-cloud
@@ -50,17 +56,20 @@ public class ShortLinkServiceImpl implements ShortLinkService {
     private final ShortCodeGenerator redisCodeGenerator;
     private final LocalSequenceShortCodeGenerator fallbackCodeGenerator;
     private final ShortLinkCacheManager cacheManager;
+    private final LinkAccessProducer accessProducer;
 
     public ShortLinkServiceImpl(ShortLinkMapper shortLinkMapper,
                                 LinkConverter linkConverter,
                                 ShortCodeGenerator redisCodeGenerator,
                                 LocalSequenceShortCodeGenerator fallbackCodeGenerator,
-                                ShortLinkCacheManager cacheManager) {
+                                ShortLinkCacheManager cacheManager,
+                                LinkAccessProducer accessProducer) {
         this.shortLinkMapper = shortLinkMapper;
         this.linkConverter = linkConverter;
         this.redisCodeGenerator = redisCodeGenerator;
         this.fallbackCodeGenerator = fallbackCodeGenerator;
         this.cacheManager = cacheManager;
+        this.accessProducer = accessProducer;
     }
 
     @Override
@@ -85,12 +94,17 @@ public class ShortLinkServiceImpl implements ShortLinkService {
 
     @Override
     public RedirectResult resolve(String shortCode, String clientIp, String userAgent) {
+        return resolve(shortCode, clientIp, userAgent, null);
+    }
+
+    @Override
+    public RedirectResult resolve(String shortCode, String clientIp, String userAgent, String referer) {
         if (StringUtils.isBlank(shortCode)) {
             return RedirectResult.notFound();
         }
 
         // 第一道闸：布隆过滤器。返回 false 表示「一定不存在」，直接 404，
-        // 不用碰 Redis 缓存，更不用回源数据库。
+        // 既不用碰缓存数据面，更不用回源数据库。
         if (!cacheManager.mightContain(shortCode)) {
             return RedirectResult.notFound();
         }
@@ -98,7 +112,7 @@ public class ShortLinkServiceImpl implements ShortLinkService {
         // 第二道闸：Redis 缓存（含空值标记）
         ShortLink cached = cacheManager.get(shortCode);
         if (cached != null) {
-            return evaluate(cached);
+            return evaluate(cached, clientIp, userAgent, referer);
         }
 
         // 第三道闸：回源数据库
@@ -109,7 +123,7 @@ public class ShortLinkServiceImpl implements ShortLinkService {
             return RedirectResult.notFound();
         }
         cacheManager.put(link);
-        return evaluate(link);
+        return evaluate(link, clientIp, userAgent, referer);
     }
 
     @Override
@@ -137,24 +151,24 @@ public class ShortLinkServiceImpl implements ShortLinkService {
     }
 
     /**
-     * 判定短链当前是否可跳转，并记录访问时间。
+     * 判定短链当前是否可跳转，并投递访问日志。
      *
-     * @param link 短链实体（可能来自缓存）
+     * <p>注意这里<b>不再同步写库</b>：PV/UV/last_access 全部由 MQ 消费者异步累加，
+     * 跳转热路径只做「一次投递」。
+     *
+     * @param link      短链实体（可能来自缓存）
+     * @param clientIp  客户端 IP
+     * @param userAgent User-Agent
+     * @param referer   来源页
      * @return 跳转结果
      */
-    private RedirectResult evaluate(ShortLink link) {
+    private RedirectResult evaluate(ShortLink link, String clientIp, String userAgent, String referer) {
         LocalDateTime now = LocalDateTime.now();
         if (!link.isRedirectable(now)) {
             return RedirectResult.gone(link);
         }
-        // 阶段 2：直接记录最近访问时间，保证后台有实时反馈。
-        // 阶段 3 起改为投递 MQ 消息，由消费者批量累加 PV/UV。
-        try {
-            shortLinkMapper.updateLastAccess(link.getId(), now);
-        } catch (Exception ex) {
-            // 统计失败不能影响跳转本身
-            log.warn("更新最近访问时间失败 linkId={} err={}", link.getId(), ex.getMessage());
-        }
+        // 投递失败已在生产者内部吞掉，不会影响跳转
+        accessProducer.publish(link, clientIp, IpHasher.hash(clientIp), userAgent, referer);
         return RedirectResult.found(link);
     }
 

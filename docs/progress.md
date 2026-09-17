@@ -248,7 +248,86 @@ wrk -t4 -c100 -d30s http://localhost:8080/{shortCode}
 
 ## 阶段 3：MQ 异步统计与管理后台 API
 
-**状态**：待开始
+**状态**：✅ 代码完成（构建与联调无法在本沙箱执行）
+
+### 交付物
+
+| 文件 | 说明 |
+| --- | --- |
+| `db/migration/V3__init_stats.sql` | `t_link_access_log`、`t_link_stats`、`t_link_uv_log` |
+| `mq/LinkAccessMessage` | 访问日志消息体 |
+| `mq/LinkAccessProducer` | 跳转时投递（**投递失败吞掉，不影响跳转**） |
+| `mq/LinkAccessConsumer` | 内存攒批（500 条 / 2 秒）+ 刷盘成功才 ack |
+| `mq/AccessLogBatchWriter` | MyBatis BATCH 执行器批量写明细 |
+| `config/RabbitMqConfig` | 交换机/队列/死信拓扑 + JSON 转换器（含受信任包白名单） |
+| `service/StatsService(+Impl)` | 访问日志落库、统计查询、趋势查询 |
+| `controller/StatsController` | `GET /api/stats/{shortCode}`、`GET /api/stats/trend` |
+| 测试 2 个类 | `StatsServiceImplTest`、`LinkAccessConsumerTest` |
+
+### 消息拓扑
+
+```
+shortlink.access.exchange (direct, routing key "link.access")
+   └─ shortlink.access.queue
+        消费失败 → shortlink.access.dlx.exchange → shortlink.access.dlx.queue
+```
+
+### 统计口径（重要，避免"看起来对但算错"）
+
+| 指标 | 口径 | 如何保证正确 |
+| --- | --- | --- |
+| PV | 访问次数 | 按 `(短码, 日期)` 聚合后**一次性** `ON DUPLICATE KEY UPDATE pv = pv + VALUES(pv)` |
+| UV | 当天独立访客 | `t_link_uv_log` 唯一键 `(short_code, stat_date, ip_hash)` + `INSERT IGNORE`，**返回 1 才算新访客** |
+| 明细 | 每次访问一行 | BATCH 执行器批量插入，时间冗余出 `access_date` / `hour` 让报表走索引 |
+
+**为什么 UV 要单开一张表**：聚合表里只有一个当天 UV 数字，无法回答
+「这个 IP 今天来过没有」。靠唯一键 + `INSERT IGNORE` 的返回值做首次访问判定，
+是唯一不引入额外存储、又能原子保证的做法。
+
+### 关键设计决策
+
+1. **刷盘成功才 ack**：先 ack 后写库，写库失败消息就永久丢了。
+   这里选择"最多重复消费"而不是"可能丢数"：UV 有唯一键天然去重，
+   PV 按批聚合，重复消费的代价远小于丢数。**这是本阶段最重要的正确性保证**，
+   已由 `LinkAccessConsumerTest#shouldNackWhenFlushFails` 覆盖。
+2. **跳转热路径彻底不写库**：阶段 2 还保留 `updateLastAccess`，
+   阶段 3 起改为投递 MQ，PV/UV/最近访问全部由消费者累加。
+3. **批量落库而非逐条**：峰值下逐条 INSERT 会打满数据库。
+   用 MyBatis BATCH 执行器而不是拼多值 INSERT——后者受 `max_allowed_packet` 限制。
+4. **Redis 只用于发布/消费通路，不用 Redis 做 PV 计数器**：
+   计数器需要定期回写且故障时会丢，直接用 MQ + 数据库更简单可靠。
+5. **`AccessLogBatchWriter` 单独抽层**：把 `SqlSessionFactory`/BATCH 这类基础设施
+   细节隔离在业务逻辑之外，`StatsServiceImpl` 才能被纯单元测试覆盖。
+6. **JSON 消息显式声明受信任包**：不依赖默认值，防反序列化攻击。
+
+### 验收命令结果
+
+```bash
+curl localhost:8080/api/stats/{shortCode}      # ❌ 未执行：服务无法启动
+curl localhost:8080/api/stats/trend            # ❌ 未执行
+```
+
+❌ **未执行**，原因同前（无网络下载依赖、本地 Maven 仓库不可写、无 Docker）。
+接口的请求/响应结构、状态码、鉴权要求均已按任务书实现并在下方静态复核。
+
+### 静态校验
+
+| 检查项 | 结果 |
+| --- | --- |
+| `@RabbitListener` 用 `@Header(AmqpHeaders.CHANNEL)` 注入 Channel（不标注则注入失败） | ✅ |
+| 手动 ack 模式与 `spring.rabbitmq.listener.simple.acknowledge-mode=manual` 一致 | ✅ |
+| `@Scheduled` 生效需 `@EnableScheduling`，启动类已标注 | ✅ |
+| 三张新表的列名与实体字段驼峰映射一致 | ✅ |
+| `upsertStats` 的 `ON DUPLICATE KEY UPDATE` 依赖 `uk_code_date` 唯一键存在 | ✅ V3 已建 |
+| `tryInsertUv` 的 `INSERT IGNORE` 依赖 `uk_code_date_ip` 唯一键存在 | ✅ V3 已建 |
+| `StatsServiceImpl` 构造器参数与 `@InjectMocks` 注入的 mock 数量一致 | ✅ 4 个 |
+
+### 测试清单（已编写，未执行）
+
+| 测试类 | 覆盖内容 |
+| --- | --- |
+| `StatsServiceImplTest` | 空批次跳过、同码同日聚合为一次 upsert、**UV 去重（重复 IP 返回 0 不计数）**、缺 ipHash 不计 UV、多组分组、冗余列填充、超长字段截断、畸形消息跳过、linkId 缺失降级、统计详情交叉校验、天数钳制 1-90、短码不存在抛 404 |
+| `LinkAccessConsumerTest` | 先入缓冲不立即落库、**成功后 ack**、**失败 nack+requeue 绝不 ack**、整批传递、空缓冲空操作、毒消息丢弃、ack 失败不外抛 |
 
 ---
 
