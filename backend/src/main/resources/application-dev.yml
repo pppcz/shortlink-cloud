@@ -12,9 +12,6 @@ mybatis-plus:
   global-config:
     banner: true
 
-redisson:
-  enabled: true
-
 shortlink:
   domain: ${SHORTLINK_DOMAIN:http://localhost:8080}
 

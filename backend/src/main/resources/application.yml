@@ -116,18 +116,6 @@ mybatis-plus:
       logic-not-delete-value: 0
       table-underline: true
 
-# ---------------- Redisson ----------------
-redisson:
-  enabled: true
-  single-server-config:
-    address: redis://${REDIS_HOST:localhost}:${REDIS_PORT:6379}
-    password: ${REDIS_PASSWORD:redis123}
-    database: ${REDIS_DATABASE:0}
-    connection-minimum-idle-size: 10
-    connection-pool-size: 64
-    timeout: 3000
-    retry-attempts: 3
-
 # ---------------- 业务配置 ----------------
 shortlink:
   # 短链域名前缀，用于返回给前端的完整短链
