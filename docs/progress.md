@@ -417,7 +417,10 @@ npm run build                    # ❌ 未执行：npm 依赖无法下载（ENOT
 
 前端**没有编写自动化测试**——本阶段未引入 Vitest，属于明确的范围取舍：
 任务书要求的是「ECharts 展示 PV/UV/趋势」的可视化界面，没有要求前端测试。
-后端的 8 个测试类覆盖了核心逻辑，前端以静态类型检查作为质量门禁。
+后端共 **10 个测试类**（`Base62Test`、`UrlValidatorTest`、`Pbkdf2PasswordEncoderTest`、
+`CacheTtlJitterTest`、`LocalSequenceShortCodeGeneratorTest`、`ShortLinkServiceImplTest`、
+`RateLimitInterceptorTest`、`RedisRateLimitServiceTest`、`StatsServiceImplTest`、
+`LinkAccessConsumerTest`）覆盖核心逻辑，前端以静态类型检查作为质量门禁。
 
 ---
 
@@ -426,7 +429,7 @@ npm run build                    # ❌ 未执行：npm 依赖无法下载（ENOT
 | 任务书中的验收动作 | 能否在本沙箱验证 | 原因 |
 | --- | --- | --- |
 | `mvn -q -DskipTests package` | ❌ | 依赖无法下载 + 本地仓库不可写 |
-| `mvn test` | ❌ | 同上。**8 个测试类均未执行过，不能声称通过** |
+| `mvn test` | ❌ | 同上。**10 个测试类均未执行过，不能声称通过** |
 | `docker compose up -d` / `ps` / `--build` | ❌ | 未安装 Docker |
 | `curl` 本地接口 | ❌ | 后端无法启动 |
 | `npm run build` | ❌ | npm 无法安装依赖（ENOTCACHED） |

@@ -254,7 +254,7 @@ shortlink-cloud/
 │   │   ├── application*.yml     # 分环境配置
 │   │   ├── db/migration/        # Flyway 迁移（V1 建表 / V2 管理员 / V3 统计）
 │   │   └── lua/                 # Redis Lua 脚本
-│   ├── src/test/java/           # 单元测试（8 个测试类）
+│   ├── src/test/java/           # 单元测试（10 个测试类）
 │   └── Dockerfile
 ├── frontend/                    # Vue3 + TS + Element Plus + ECharts
 │   ├── src/{api,components,layout,router,store,views}
