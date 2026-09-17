@@ -13,6 +13,7 @@ import com.shortlink.cloud.service.LinkConverter;
 import com.shortlink.cloud.service.LocalSequenceShortCodeGenerator;
 import com.shortlink.cloud.service.RedirectResult;
 import com.shortlink.cloud.service.ShortCodeGenerator;
+import com.shortlink.cloud.service.ShortLinkCacheManager;
 import com.shortlink.cloud.service.ShortLinkService;
 import com.shortlink.cloud.util.UrlValidator;
 import lombok.extern.slf4j.Slf4j;
@@ -21,15 +22,19 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.Locale;
 import java.util.regex.Pattern;
 
 /**
  * 短链服务实现。
  *
- * <p>阶段 1：短码由 Redis 发号（不可用时退化为本地序列），跳转直接查库。
- * 阶段 2 会在 {@link #resolve} 前增加 Redis 缓存与布隆过滤器，
- * 阶段 3 会把访问日志投递到 MQ 异步统计。
+ * <p>跳转链路（阶段 2 起）：
+ * <pre>
+ *   布隆过滤器（一定不存在 → 直接 404，挡住绝大多数无效请求）
+ *        ↓ 可能存在
+ *   Redis 缓存（命中 → 直接 302；空值标记 → 直接 404）
+ *        ↓ 未命中
+ *   MySQL 回源 → 回写缓存
+ * </pre>
  *
  * @author shortlink-cloud
  */
@@ -44,15 +49,18 @@ public class ShortLinkServiceImpl implements ShortLinkService {
     private final LinkConverter linkConverter;
     private final ShortCodeGenerator redisCodeGenerator;
     private final LocalSequenceShortCodeGenerator fallbackCodeGenerator;
+    private final ShortLinkCacheManager cacheManager;
 
     public ShortLinkServiceImpl(ShortLinkMapper shortLinkMapper,
                                 LinkConverter linkConverter,
                                 ShortCodeGenerator redisCodeGenerator,
-                                LocalSequenceShortCodeGenerator fallbackCodeGenerator) {
+                                LocalSequenceShortCodeGenerator fallbackCodeGenerator,
+                                ShortLinkCacheManager cacheManager) {
         this.shortLinkMapper = shortLinkMapper;
         this.linkConverter = linkConverter;
         this.redisCodeGenerator = redisCodeGenerator;
         this.fallbackCodeGenerator = fallbackCodeGenerator;
+        this.cacheManager = cacheManager;
     }
 
     @Override
@@ -80,23 +88,28 @@ public class ShortLinkServiceImpl implements ShortLinkService {
         if (StringUtils.isBlank(shortCode)) {
             return RedirectResult.notFound();
         }
-        ShortLink link = findByCode(shortCode);
-        if (link == null) {
+
+        // 第一道闸：布隆过滤器。返回 false 表示「一定不存在」，直接 404，
+        // 不用碰 Redis 缓存，更不用回源数据库。
+        if (!cacheManager.mightContain(shortCode)) {
             return RedirectResult.notFound();
         }
-        LocalDateTime now = LocalDateTime.now();
-        if (!link.isRedirectable(now)) {
-            return RedirectResult.gone(link);
+
+        // 第二道闸：Redis 缓存（含空值标记）
+        ShortLink cached = cacheManager.get(shortCode);
+        if (cached != null) {
+            return evaluate(cached);
         }
-        // 阶段 1：直接记录最近访问时间，保证后台有实时反馈。
-        // 阶段 3 起改为投递 MQ 消息，由消费者批量累加 PV/UV。
-        try {
-            shortLinkMapper.updateLastAccess(link.getId(), now);
-        } catch (Exception ex) {
-            // 统计失败不能影响跳转本身
-            log.warn("更新最近访问时间失败 linkId={} err={}", link.getId(), ex.getMessage());
+
+        // 第三道闸：回源数据库
+        ShortLink link = findByCode(shortCode);
+        if (link == null) {
+            // 防缓存穿透：写入短 TTL 的空值标记
+            cacheManager.putNull(shortCode);
+            return RedirectResult.notFound();
         }
-        return RedirectResult.found(link);
+        cacheManager.put(link);
+        return evaluate(link);
     }
 
     @Override
@@ -106,6 +119,8 @@ public class ShortLinkServiceImpl implements ShortLinkService {
             return;
         }
         shortLinkMapper.updateStatus(id, Constants.STATUS_DISABLED);
+        // 状态变更必须让缓存立刻失效，否则禁用后仍会跳转直到 TTL 到期
+        cacheManager.invalidate(existing.getShortCode());
         log.info("短链已禁用 id={} code={}", id, existing.getShortCode());
     }
 
@@ -119,6 +134,28 @@ public class ShortLinkServiceImpl implements ShortLinkService {
             throw new BizException(ErrorCode.LINK_NOT_FOUND);
         }
         return link;
+    }
+
+    /**
+     * 判定短链当前是否可跳转，并记录访问时间。
+     *
+     * @param link 短链实体（可能来自缓存）
+     * @return 跳转结果
+     */
+    private RedirectResult evaluate(ShortLink link) {
+        LocalDateTime now = LocalDateTime.now();
+        if (!link.isRedirectable(now)) {
+            return RedirectResult.gone(link);
+        }
+        // 阶段 2：直接记录最近访问时间，保证后台有实时反馈。
+        // 阶段 3 起改为投递 MQ 消息，由消费者批量累加 PV/UV。
+        try {
+            shortLinkMapper.updateLastAccess(link.getId(), now);
+        } catch (Exception ex) {
+            // 统计失败不能影响跳转本身
+            log.warn("更新最近访问时间失败 linkId={} err={}", link.getId(), ex.getMessage());
+        }
+        return RedirectResult.found(link);
     }
 
     /**
@@ -156,6 +193,8 @@ public class ShortLinkServiceImpl implements ShortLinkService {
             entity.setId(IdWorker.getId());
             try {
                 shortLinkMapper.insert(entity);
+                // 新短码立刻进入布隆过滤器，否则下一次访问会被预判为「一定不存在」
+                cacheManager.addToBloom(shortCode);
                 log.info("短链创建成功 code={} id={} generator={}",
                         shortCode, entity.getId(), custom ? "custom" : "auto");
                 return linkConverter.toCreateResponse(entity);
@@ -179,36 +218,5 @@ public class ShortLinkServiceImpl implements ShortLinkService {
             log.warn("Redis 发号失败，降级为本地序列生成器: {}", ex.getMessage());
             return fallbackCodeGenerator.nextCode();
         }
-    }
-
-    /**
-     * 校验短码字符集（供 Controller 在做重定向前置判断时使用）。
-     *
-     * @param shortCode 短码
-     * @return 是否为合法短码格式
-     */
-    public static boolean isWellFormedCode(String shortCode) {
-        if (StringUtils.isBlank(shortCode) || shortCode.length() > 32) {
-            return false;
-        }
-        for (int i = 0; i < shortCode.length(); i++) {
-            char c = shortCode.charAt(i);
-            boolean ok = (c >= '0' && c <= '9')
-                    || (c >= 'a' && c <= 'z')
-                    || (c >= 'A' && c <= 'Z');
-            if (!ok) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /** 规范化短码（仅保留字母数字，用于日志防注入）。 */
-    static String normalizeForLog(String shortCode) {
-        if (shortCode == null) {
-            return "";
-        }
-        String cleaned = shortCode.replaceAll("[^0-9a-zA-Z]", "");
-        return cleaned.length() > 32 ? cleaned.substring(0, 32) : cleaned.toLowerCase(Locale.ROOT);
     }
 }

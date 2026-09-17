@@ -168,7 +168,81 @@ mvn test                                            # ❌ 同上（依赖无法�
 
 ## 阶段 2：Redis 缓存、布隆过滤器、限流
 
-**状态**：待开始
+**状态**：✅ 代码完成（构建/压测无法在本沙箱执行）
+
+### 交付物
+
+| 文件 | 说明 |
+| --- | --- |
+| `service/ShortLinkCacheManager(+Impl)` | Redisson 缓存读写、空值标记、布隆过滤器、TTL 抖动、主动失效、启动预热 |
+| `service/RateLimitService(+RedisImpl)` | Redis + Lua 固定窗口限流，脚本 SHA 缓存 + NOSCRIPT 自动重载 |
+| `service/CreateQuotaService(+RedisImpl)` | 按 IP 单日创建量限制（防「慢速刷」） |
+| `config/RateLimitInterceptor` | 跳转请求 IP 限流，命中即 429，回写 `X-RateLimit-*` 头 |
+| `config/BloomFilterWarmUpRunner` | `ApplicationReadyEvent` 时预热布隆过滤器 |
+| `config/SentinelConfig` | 代码方式声明 QPS 流控规则 + 注册 `SentinelResourceAspect` |
+| `config/RedissonConfig` | 复用 `spring.data.redis.*` 构造 `RedissonClient` |
+| `resources/lua/rate_limit.lua` | 原子 INCR + EXPIRE 脚本 |
+| 测试 3 个类 | 见下表 |
+
+### 跳转链路（阶段 2 起）
+
+```
+请求 GET /{code}
+  ↓
+RateLimitInterceptor：IP 维度固定窗口（Redis+Lua，1 秒桶）
+  ↓ 放行
+布隆过滤器：判定「一定不存在」→ 直接 404（挡住绝大多数无效/恶意请求，不碰 Redis 数据面）
+  ↓ 可能存在
+Redis 缓存：命中 → 校验状态/过期 → 302
+           命中空值标记 → 直接 404（缓存穿透防护）
+  ↓ 未命中
+MySQL 回源 → 回写缓存（TTL = min(1h, 距过期秒数) × ±20% 抖动）
+```
+
+### 缓存三大问题的具体落点
+
+| 问题 | 方案 | 代码位置 |
+| --- | --- | --- |
+| 缓存穿透 | Redisson 布隆过滤器预判 + 空值标记（短 TTL，默认 60s） | `mightContain` / `putNull` |
+| 缓存雪崩 | TTL 施加 ±20% 随机抖动 | `jitter` |
+| 缓存击穿 | TTL 取 `min(配置 TTL, 距短链过期秒数)`，避免大量 key 同时失效；热点重建依赖 Redis 单线程 + 短 TTL | `ttlFor` |
+| 缓存一致性 | 禁用短链时主动 `invalidate`，否则禁用后仍会跳到 TTL 到期 | `ShortLinkServiceImpl#disable` |
+
+### 关键设计决策
+
+1. **布隆过滤器必须预热**：布隆过滤器只能加不能删，进程重启后内存位图丢失，
+   不预热会让**全部存量短链被误判为不存在**（这是最容易踩的坑）。
+   放在 `ApplicationReadyEvent` 而非 `@PostConstruct`，因为此时数据源与 Flyway 迁移才就绪。
+2. **布隆过滤器显式用二进制 codec**：`RBloomFilter` 底层是位图，
+   若被 JSON codec 包一层会导致位运算数据损坏。
+3. **一切缓存/限流故障都降级而非报错**：缓存读失败 → 回源 DB；
+   布隆过滤器失败 → 保守返回「可能存在」；限流组件故障 → **fail-open 放行**。
+   取舍理由：防护组件不应成为跳转链路的单点故障。
+4. **同时用 Redis 限流与 Sentinel**：前者按 IP 维度防刷（跨实例共享计数），
+   后者做接口级总量兜底（本地快速失败，不需要 Redis 往返）。
+5. **Lua 脚本用 EVALSHA + NOSCRIPT 重载**：避免每次请求传输脚本文本；
+   Redis 重启后脚本缓存丢失能自动恢复，而不是永久退化为 500。
+
+### 验收命令结果
+
+```bash
+wrk -t4 -c100 -d30s http://localhost:8080/{shortCode}
+# 查看缓存命中率、QPS、P99
+```
+
+❌ **未执行**：沙箱内 `wrk` 不存在，后端也无法启动（依赖无法下载 + 无 Docker）。
+因此**缓存命中率、QPS、P99 三项指标本阶段没有任何实测数据**，
+不会用任何推测值代替。压测方法与指标采集口径见 `docs/benchmark.md`（阶段 4 补齐），
+实测数据需在有 Docker 与网络的机器上跑出后填入。
+
+### 测试清单（已编写，未执行）
+
+| 测试类 | 覆盖内容 |
+| --- | --- |
+| `ShortLinkServiceImplTest`（阶段 2 扩充） | 布隆过滤器短路、缓存命中不回源、未命中回源并回写、空值穿透防护、禁用后失效缓存 |
+| `RateLimitInterceptorTest` | 配额内放行 + 响应头、超限 429 + 统一错误体、非 GET/多段路径/根路径跳过、阈值 0 关闭 |
+| `RedisRateLimitServiceTest` | 阈值边界（等于阈值放行）、超限拒绝、**Redis 异常 fail-open**、NOSCRIPT 自动重载 |
+| `CacheTtlJitterTest` | 抖动区间 ±20%、确实打散、TTL 下限 1 秒、关闭抖动的分支 |
 
 ---
 

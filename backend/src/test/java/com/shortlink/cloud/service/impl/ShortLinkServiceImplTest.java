@@ -12,6 +12,7 @@ import com.shortlink.cloud.service.LinkConverter;
 import com.shortlink.cloud.service.LocalSequenceShortCodeGenerator;
 import com.shortlink.cloud.service.RedirectResult;
 import com.shortlink.cloud.service.ShortCodeGenerator;
+import com.shortlink.cloud.service.ShortLinkCacheManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,6 +29,7 @@ import java.time.LocalDateTime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -35,8 +37,8 @@ import static org.mockito.Mockito.when;
 /**
  * {@link ShortLinkServiceImpl} 单元测试。
  *
- * <p>Mapper 与发号器均为 mock，测试只覆盖业务编排逻辑（校验、重试、状态判定），
- * 不依赖 MySQL / Redis。
+ * <p>Mapper、发号器、缓存均为 mock，测试只覆盖业务编排逻辑
+ * （校验、重试、状态判定、缓存穿透防护顺序），不依赖 MySQL / Redis。
  *
  * @author shortlink-cloud
  */
@@ -55,6 +57,9 @@ class ShortLinkServiceImplTest {
     @Mock
     private LocalSequenceShortCodeGenerator fallbackCodeGenerator;
 
+    @Mock
+    private ShortLinkCacheManager cacheManager;
+
     private ShortLinkServiceImpl service;
 
     @BeforeEach
@@ -62,7 +67,8 @@ class ShortLinkServiceImplTest {
         ShortLinkProperties properties = new ShortLinkProperties();
         properties.setDomain(DOMAIN);
         LinkConverter converter = new LinkConverter(properties);
-        service = new ShortLinkServiceImpl(shortLinkMapper, converter, redisCodeGenerator, fallbackCodeGenerator);
+        service = new ShortLinkServiceImpl(shortLinkMapper, converter, redisCodeGenerator,
+                fallbackCodeGenerator, cacheManager);
     }
 
     // ------------------------------------------------------------------
@@ -96,6 +102,20 @@ class ShortLinkServiceImplTest {
         assertThat(saved.getUv()).isZero();
         assertThat(saved.getId()).isNotNull();
         assertThat(saved.getExpireTime()).isNull();
+    }
+
+    @Test
+    @DisplayName("新短码立即写入布隆过滤器，避免下次访问被误判为不存在")
+    void shouldAddNewCodeToBloomFilter() {
+        when(redisCodeGenerator.nextCode()).thenReturn("bloom01");
+        when(shortLinkMapper.insert(any(ShortLink.class))).thenReturn(1);
+
+        CreateLinkRequest request = new CreateLinkRequest();
+        request.setOriginalUrl("https://example.com");
+
+        service.createLink(request, null, "1.2.3.4");
+
+        verify(cacheManager).addToBloom("bloom01");
     }
 
     @Test
@@ -230,74 +250,102 @@ class ShortLinkServiceImplTest {
                 .extracting(ex -> ((BizException) ex).getErrorCode())
                 .isEqualTo(ErrorCode.URL_INVALID);
 
-        verify(shortLinkMapper, times(0)).insert(any(ShortLink.class));
+        verify(shortLinkMapper, never()).insert(any(ShortLink.class));
     }
 
     // ------------------------------------------------------------------
-    // 跳转
+    // 跳转：缓存 / 布隆过滤器 / 回源 三级链路
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("命中启用中的短链返回 302 与目标地址")
-    void shouldResolveEnabledLink() {
-        ShortLink link = link(1L, "abc1234", 1, null);
-        when(shortLinkMapper.selectOne(any(Wrapper.class))).thenReturn(link);
+    @DisplayName("布隆过滤器判定不存在时直接 404，不查缓存也不回源")
+    void shouldShortCircuitWhenBloomFilterMisses() {
+        when(cacheManager.mightContain("ghost01")).thenReturn(false);
 
-        RedirectResult result = service.resolve("abc1234", "1.2.3.4", "curl/8.0");
+        RedirectResult result = service.resolve("ghost01", "1.2.3.4", "curl/8.0");
+
+        assertThat(result.httpStatus()).isEqualTo(404);
+        verify(cacheManager, never()).get(any());
+        verify(shortLinkMapper, never()).selectOne(any(Wrapper.class));
+    }
+
+    @Test
+    @DisplayName("缓存命中直接 302，不回源数据库")
+    void shouldServeFromCache() {
+        when(cacheManager.mightContain("hot1234")).thenReturn(true);
+        when(cacheManager.get("hot1234")).thenReturn(link(1L, "hot1234", 1, null));
+
+        RedirectResult result = service.resolve("hot1234", "1.2.3.4", "curl/8.0");
 
         assertThat(result.isFound()).isTrue();
-        assertThat(result.httpStatus()).isEqualTo(302);
         assertThat(result.targetUrl()).isEqualTo("https://example.com/target");
-        verify(shortLinkMapper).updateLastAccess(any(), any(LocalDateTime.class));
+        verify(shortLinkMapper, never()).selectOne(any(Wrapper.class));
+        verify(shortLinkMapper, never()).insert(any(ShortLink.class));
     }
 
     @Test
-    @DisplayName("短码不存在返回 404")
-    void shouldReturnNotFoundForUnknownCode() {
+    @DisplayName("缓存未命中时回源数据库并回写缓存")
+    void shouldLoadFromDatabaseAndPopulateCache() {
+        when(cacheManager.mightContain("cold123")).thenReturn(true);
+        when(cacheManager.get("cold123")).thenReturn(null);
+        ShortLink fromDb = link(7L, "cold123", 1, null);
+        when(shortLinkMapper.selectOne(any(Wrapper.class))).thenReturn(fromDb);
+
+        RedirectResult result = service.resolve("cold123", "1.2.3.4", "curl/8.0");
+
+        assertThat(result.isFound()).isTrue();
+        verify(cacheManager).put(fromDb);
+    }
+
+    @Test
+    @DisplayName("数据库未命中时写入空值标记，防缓存穿透")
+    void shouldCacheNullWhenDatabaseMisses() {
+        when(cacheManager.mightContain("void123")).thenReturn(true);
+        when(cacheManager.get("void123")).thenReturn(null);
         when(shortLinkMapper.selectOne(any(Wrapper.class))).thenReturn(null);
 
-        RedirectResult result = service.resolve("nope123", "1.2.3.4", "curl/8.0");
+        RedirectResult result = service.resolve("void123", "1.2.3.4", "curl/8.0");
 
-        assertThat(result.isFound()).isFalse();
         assertThat(result.httpStatus()).isEqualTo(404);
-        assertThat(result.targetUrl()).isNull();
+        verify(cacheManager).putNull("void123");
     }
 
     @Test
-    @DisplayName("禁用状态返回 410")
-    void shouldReturnGoneForDisabledLink() {
-        when(shortLinkMapper.selectOne(any(Wrapper.class)))
-                .thenReturn(link(2L, "dis1234", 0, null));
+    @DisplayName("缓存中的禁用短链返回 410")
+    void shouldReturnGoneForDisabledLinkFromCache() {
+        when(cacheManager.mightContain("dis1234")).thenReturn(true);
+        when(cacheManager.get("dis1234")).thenReturn(link(2L, "dis1234", 0, null));
 
-        RedirectResult result = service.resolve("dis1234", "1.2.3.4", "curl/8.0");
-
-        assertThat(result.httpStatus()).isEqualTo(410);
-        assertThat(result.targetUrl()).isNull();
+        assertThat(service.resolve("dis1234", "1.2.3.4", "curl/8.0").httpStatus()).isEqualTo(410);
     }
 
     @Test
-    @DisplayName("已过期返回 410")
-    void shouldReturnGoneForExpiredLink() {
-        when(shortLinkMapper.selectOne(any(Wrapper.class)))
+    @DisplayName("缓存中的过期短链返回 410")
+    void shouldReturnGoneForExpiredLinkFromCache() {
+        when(cacheManager.mightContain("exp1234")).thenReturn(true);
+        when(cacheManager.get("exp1234"))
                 .thenReturn(link(3L, "exp1234", 1, LocalDateTime.now().minusSeconds(1)));
 
-        RedirectResult result = service.resolve("exp1234", "1.2.3.4", "curl/8.0");
-
-        assertThat(result.httpStatus()).isEqualTo(410);
+        assertThat(service.resolve("exp1234", "1.2.3.4", "curl/8.0").httpStatus()).isEqualTo(410);
     }
 
     @Test
-    @DisplayName("空短码直接 404，不查库")
-    void shouldNotHitDatabaseForBlankCode() {
-        assertThat(service.resolve("  ", "1.2.3.4", "curl/8.0").httpStatus()).isEqualTo(404);
-        verify(shortLinkMapper, times(0)).selectOne(any(Wrapper.class));
+    @DisplayName("命中短链时更新最近访问时间")
+    void shouldUpdateLastAccessOnHit() {
+        when(cacheManager.mightContain("abc1234")).thenReturn(true);
+        when(cacheManager.get("abc1234")).thenReturn(link(5L, "abc1234", 1, null));
+        when(shortLinkMapper.updateLastAccess(any(), any(LocalDateTime.class))).thenReturn(1);
+
+        service.resolve("abc1234", "1.2.3.4", "curl/8.0");
+
+        verify(shortLinkMapper).updateLastAccess(any(), any(LocalDateTime.class));
     }
 
     @Test
     @DisplayName("统计更新失败不影响跳转结果")
     void shouldStillRedirectWhenStatsUpdateFails() {
-        when(shortLinkMapper.selectOne(any(Wrapper.class)))
-                .thenReturn(link(4L, "ok12345", 1, null));
+        when(cacheManager.mightContain("ok12345")).thenReturn(true);
+        when(cacheManager.get("ok12345")).thenReturn(link(4L, "ok12345", 1, null));
         when(shortLinkMapper.updateLastAccess(any(), any(LocalDateTime.class)))
                 .thenThrow(new RuntimeException("db down"));
 
@@ -307,19 +355,29 @@ class ShortLinkServiceImplTest {
         assertThat(result.targetUrl()).isEqualTo("https://example.com/target");
     }
 
+    @Test
+    @DisplayName("空短码直接 404，不触碰缓存与数据库")
+    void shouldNotHitAnythingForBlankCode() {
+        assertThat(service.resolve("  ", "1.2.3.4", "curl/8.0").httpStatus()).isEqualTo(404);
+        verify(cacheManager, never()).mightContain(any());
+        verify(shortLinkMapper, never()).selectOne(any(Wrapper.class));
+    }
+
     // ------------------------------------------------------------------
     // 禁用
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("禁用短链写入 status=0")
-    void shouldDisableLink() {
+    @DisplayName("禁用短链写入 status=0 并立即失效缓存")
+    void shouldDisableLinkAndInvalidateCache() {
         when(shortLinkMapper.selectById(9L)).thenReturn(link(9L, "disable1", 1, null));
         when(shortLinkMapper.updateStatus(9L, 0)).thenReturn(1);
 
         service.disable(9L);
 
         verify(shortLinkMapper).updateStatus(9L, 0);
+        // 不失效缓存的话，禁用后仍会跳到 TTL 到期为止
+        verify(cacheManager).invalidate("disable1");
     }
 
     @Test

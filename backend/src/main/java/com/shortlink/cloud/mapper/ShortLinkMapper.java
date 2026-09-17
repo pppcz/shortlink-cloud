@@ -4,9 +4,11 @@ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.shortlink.cloud.entity.ShortLink;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 /**
  * 短链 Mapper。
@@ -60,4 +62,15 @@ public interface ShortLinkMapper extends BaseMapper<ShortLink> {
     @Update("UPDATE t_short_link SET last_access = #{lastAccess} "
             + "WHERE id = #{id} AND deleted = 0")
     int updateLastAccess(@Param("id") Long id, @Param("lastAccess") LocalDateTime lastAccess);
+
+    /**
+     * 查询全部短码，用于应用启动时预热布隆过滤器。
+     *
+     * <p>布隆过滤器的位图存在 Redis 中，但进程重启后若要重建仍需数据源；
+     * 这里只 select 短码一列，百万级数据下也是走覆盖索引的窄查询。
+     *
+     * @return 全部短码（逻辑删除的自动排除）
+     */
+    @Select("SELECT short_code FROM t_short_link WHERE deleted = 0")
+    List<String> selectAllShortCodes();
 }

@@ -18,12 +18,19 @@ import org.springframework.web.util.pattern.PathPatternParser;
 public class WebMvcConfig implements WebMvcConfigurer {
 
     private final JwtAuthInterceptor jwtAuthInterceptor;
+    private final RateLimitInterceptor rateLimitInterceptor;
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
-        // 只挂在 /api/** 上：短链跳转（/{code}）不经过任何鉴权，保持热路径最轻
+        // 限流挂在最外层：命中限流立刻 429，不再进入缓存 / DB
+        registry.addInterceptor(rateLimitInterceptor)
+                .addPathPatterns("/**")
+                .order(0);
+
+        // 鉴权只挂在 /api/** 上：短链跳转（/{code}）不经过鉴权，保持热路径最轻
         registry.addInterceptor(jwtAuthInterceptor)
-                .addPathPatterns("/api/**");
+                .addPathPatterns("/api/**")
+                .order(1);
     }
 
     @Override
