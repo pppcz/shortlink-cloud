@@ -1,0 +1,216 @@
+# =====================================================================
+# shortlink-cloud CI
+#
+# 目的：本地沙箱无法编译/运行本仓库（无网络、无 Docker），
+#       因此把「编译 + 测试 + 构建」全部交给 GitHub Actions 执行。
+#       推送后每次改动都会自动验证，这是本仓库唯一的真实质量门禁。
+#
+# 三个阶段：
+#   backend-unit        后端编译 + 单元测试（不依赖中间件，最快）
+#   backend-integration 真实 MySQL/Redis/RabbitMQ 集成测试（Testcontainers）
+#   frontend            前端类型检查 + 生产构建
+# =====================================================================
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# 同一分支的重复推送取消旧任务，节省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Maven 输出用英文，避免中文 locale 造成日志乱码
+  MAVEN_OPTS: "-Dfile.encoding=UTF-8 -Duser.language=en -Duser.country=US"
+
+jobs:
+  # ------------------------------------------------------------------
+  # 后端：编译 + 单元测试
+  # ------------------------------------------------------------------
+  backend-unit:
+    name: 后端编译与单元测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # -B 批处理模式；单元测试不依赖任何中间件
+      - name: 编译并运行单元测试
+        working-directory: backend
+        run: mvn -B -ntp test
+
+      - name: 生成测试报告摘要
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-surefire-reports
+          path: backend/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # 后端：集成测试（真实中间件）
+  # ------------------------------------------------------------------
+  backend-integration:
+    name: 后端集成测试（MySQL/Redis/RabbitMQ）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # integration profile 只跑 @Tag("integration") 的用例，需要 Docker；
+      # ubuntu-latest runner 自带 Docker，无需额外配置。
+      - name: 运行集成测试
+        working-directory: backend
+        run: mvn -B -ntp -Pintegration test
+
+      - name: 生成测试报告摘要
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-integration-reports
+          path: backend/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # 集成测试失败时把容器日志捞出来，否则很难定位
+      - name: 失败时输出服务日志
+        if: failure()
+        run: |
+          echo "=== docker ps ==="
+          docker ps -a || true
+          for name in $(docker ps -a --format '{{.Names}}'); do
+            echo "=== logs: ${name} ==="
+            docker logs --tail 100 "${name}" 2>&1 || true
+          done
+
+  # ------------------------------------------------------------------
+  # 后端：打包（确认可产出可运行 jar）
+  # ------------------------------------------------------------------
+  backend-package:
+    name: 后端打包
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: 打包（跳过测试，测试由上面两个 job 负责）
+        working-directory: backend
+        run: mvn -B -ntp -DskipTests package
+
+      - name: 校验 jar 产物存在
+        working-directory: backend
+        run: |
+          ls -lh target/*.jar
+          test -f target/shortlink-cloud-backend.jar
+
+      - name: 上传 jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: shortlink-cloud-backend-jar
+          path: backend/target/shortlink-cloud-backend.jar
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # 前端：类型检查 + 构建
+  # ------------------------------------------------------------------
+  frontend:
+    name: 前端类型检查与构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # package-lock.json 尚未提交（首次生成于使用者本地），
+      # 因此这里根据 lock 文件是否存在选择 npm ci / npm install
+      - name: 安装依赖
+        working-directory: frontend
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::warning::未找到 package-lock.json，回退到 npm install"
+            npm install
+          fi
+
+      # 单独跑一次类型检查，把 vue-tsc 报错从构建失败里区分出来
+      - name: TypeScript 类型检查
+        working-directory: frontend
+        run: npm run type-check
+
+      - name: 生产构建
+        working-directory: frontend
+        run: npm run build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Docker 镜像构建（只验证能构建，不推送）
+  # ------------------------------------------------------------------
+  docker-build:
+    name: Docker 镜像构建验证
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建后端镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          tags: shortlink-cloud/backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 构建前端镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          tags: shortlink-cloud/frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 校验 compose 文件语法
+        run: docker compose config --quiet && echo "docker-compose.yml 语法正确"

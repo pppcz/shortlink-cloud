@@ -29,6 +29,7 @@
         <jjwt.version>0.12.5</jjwt.version>
         <commons-lang3.version>3.14.0</commons-lang3.version>
         <guava.version>33.2.1-jre</guava.version>
+        <testcontainers.version>1.20.3</testcontainers.version>
     </properties>
 
     <dependencies>
@@ -157,14 +158,39 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>com.h2database</groupId>
-            <artifactId>h2</artifactId>
-            <scope>test</scope>
-        </dependency>
+        <!-- 刻意不引入 H2：本项目 SQL 使用 MySQL 方言（如 DELETE ... LIMIT），
+             H2 无法验证，靠 Testcontainers 起真实 MySQL。 -->
         <dependency>
             <groupId>org.awaitility</groupId>
             <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testcontainers：集成测试启动真实 MySQL / Redis / RabbitMQ。
+             这是本项目唯一能覆盖「SQL 是否写对、序列化是否兼容、迁移是否可执行」
+             的手段——单元测试全部使用 mock，覆盖不到这些。 -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mysql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>rabbitmq</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -205,7 +231,10 @@
                 </configuration>
             </plugin>
 
-            <!-- 单元测试：surefire -->
+            <!-- 单元测试：surefire
+                 默认排除 @Tag("integration") 的用例，因为集成测试需要 Docker
+                 启动 MySQL/Redis/RabbitMQ，不应该拖慢每次构建。
+                 需要跑集成测试时加 -Pintegration。 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
@@ -225,4 +254,28 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- ============================================================
+             integration profile：只跑集成测试
+             用法： mvn -Pintegration test
+             要求： 本机已安装并启动 Docker
+             ============================================================ -->
+        <profile>
+            <id>integration</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <!-- 反转过滤：只跑 integration 组，不排除任何组 -->
+                            <groups>integration</groups>
+                            <excludedGroups>none</excludedGroups>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

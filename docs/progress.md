@@ -498,3 +498,109 @@ cd .. && cp .env.example .env && docker compose up -d --build && docker compose 
    理论上 MyBatis 3.5.16 会原样传递 SQL 字符串，但未实测。
 5. **jackson 反序列化 `LocalDateTime`** 到缓存实体时区问题——
    `application.yml` 已配 `time-zone: Asia/Shanghai`，但未实测。
+
+### 一键验证脚本
+
+上面这些步骤已封装成脚本，按顺序执行并在失败处立即停止：
+
+```powershell
+# Windows：完整验证
+pwsh -File scripts/verify.ps1
+
+# 跳过需要 Docker 的步骤
+pwsh -File scripts/verify.ps1 -SkipDocker
+```
+
+脚本会逐步输出「通过 / 失败 / 跳过」，失败时给出排查方向。
+⚠️ **该脚本自身也未被执行过**——它是新写的，如遇脚本自身的语法问题请直接反馈。
+
+### 云端 CI（推荐优先使用）
+
+`.github/workflows/ci.yml` 把上述验证搬到 GitHub Actions，推送后自动执行：
+
+| Job | 内容 |
+| --- | --- |
+| `backend-unit` | 编译 + 10 个单元测试类 |
+| `backend-integration` | Testcontainers 起真实 MySQL/Redis/RabbitMQ 跑集成测试 |
+| `backend-package` | 打包并校验 jar 产物 |
+| `frontend` | TypeScript 类型检查 + 生产构建 |
+| `docker-build` | 两个镜像构建验证 + `docker compose config` 语法校验 |
+
+**这是把"未验证代码"变成"已验证"的最省事路径**：推送即触发，无需本地装 Docker。
+
+---
+
+## 附加批次：为「学习/面试」用途补齐的内容
+
+首次交付后用户说明用途是学习与面试，因此补做了以下内容。
+**以下全部同样未在沙箱内执行。**
+
+### 1. 数据保留清理（修复只增不删的表）
+
+| 文件 | 说明 |
+| --- | --- |
+| `config/RetentionProperties.java` | 保留天数、批大小、单次最大批次、cron 均可配 |
+| `service/DataRetentionService(+Impl)` | 每天 03:30 分批删除过期明细，带防重入 |
+| `mapper/LinkAccessLogMapper#deleteBeforeDate` | `DELETE ... LIMIT`（MySQL 方言） |
+| `mapper/LinkUvLogMapper#deleteBeforeDate` | 同上 |
+
+**修掉的问题**：`t_link_access_log` 与 `t_link_uv_log` 原本只增不删。
+按日活 10 万、人均 3 次估算，一年约 1 亿行，最终写满磁盘、索引不可维护。
+
+**为什么不用分区表**：分区要求把分区列纳入主键，且新增分区要提前建。
+对"每天跑一次清理"的中等规模系统，索引 + 分批 DELETE 的复杂度更低。
+真到单表过亿、需要秒级 `DROP` 历史时再上分区。
+
+### 2. 集成测试（填补真实中间件链路的零覆盖）
+
+| 文件 | 覆盖内容 |
+| --- | --- |
+| `integration/AbstractIntegrationTest.java` | Testcontainers 单例容器基类（MySQL 8.0.39 / Redis 7.2.5 / RabbitMQ 3.13.7，版本与 compose 一致） |
+| `integration/ShortLinkFlowIntegrationTest.java` | 迁移可执行性、唯一索引真实生效、创建跳转主链路、缓存回写与 `LocalDateTime` 字段完整性、空值穿透、禁用立即失效缓存、过期 410、MQ 落库与 PV/UV 口径、Lua 限流阈值与 TTL、布隆过滤器预热与误判率 |
+| `integration/DataRetentionIntegrationTest.java` | 清理窗口边界、空操作、批次上限约束 |
+
+**为什么必须有这一层**：原有 10 个单元测试类全部使用 mock，
+**验证不了 SQL 语法、Flyway 迁移可执行性、JSON 序列化兼容性**。
+例如清理用的 `DELETE ... LIMIT` 是 MySQL 方言，H2 与 mock 都测不出来。
+因此同时**移除了 H2 依赖**——它给不了真实方言覆盖，留着只会造成"测过了"的错觉。
+
+### 3. 工程化配套
+
+| 文件 | 说明 |
+| --- | --- |
+| `.github/workflows/ci.yml` | 5 个 job 的完整 CI |
+| `scripts/verify.ps1` | 本地一键验证，失败即停 |
+| `docs/interview-guide.md` | 面试讲述指南：9 个决策点的"怎么答"、不足之处的答法、技术细节速查 |
+| `LICENSE` | MIT |
+| `pom.xml` | 新增 `integration` profile；移除 H2；新增 Testcontainers 依赖 |
+
+### 4. 种子密码哈希再次交叉验证（本批次唯一真正验证过的一项）
+
+```
+salt length : 16 bytes (Java expects 16)
+hash length : 32 bytes (Java expects 256-bit key)
+iterations  : 210000
+expected: RfAgy57mSojqBpfe9GZYHy5atqpysHk3JOmMagNFkKc=
+actual  : RfAgy57mSojqBpfe9GZYHy5atqpysHk3JOmMagNFkKc=
+HASH REPRODUCES: True
+wrong password rejected: True
+wrong iteration rejected: True
+```
+
+即 `V2__seed_admin_user.sql` 中的哈希确实等于
+`PBKDF2-HMAC-SHA256("admin123", 盐, 210000 次, 256 位)`，
+参数与 `Pbkdf2PasswordEncoder` 默认值完全一致。
+**管理员的密码校验链路无需等 CI 即可确认正确。**
+
+### 5. 附加批次仍未验证的事项
+
+| 项目 | 状态 |
+| --- | --- |
+| 新增的 2 个集成测试类 | ❌ 未执行（需 Docker） |
+| 新增的清理逻辑（`DELETE ... LIMIT`） | ❌ 未执行 |
+| `mvn -Pintegration test` | ❌ 未执行 |
+| CI workflow 语法 | ❌ 未校验 |
+| `scripts/verify.ps1` | ❌ 未执行（脚本自身未跑过） |
+| 前端类型检查 | ❌ 仍未执行 |
+| 推送到 GitHub | ❌ 实测仍被阻断（TLS `SEC_E_NO_CREDENTIALS`），代码尚未上传任何远端 |
+

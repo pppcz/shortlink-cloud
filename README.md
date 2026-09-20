@@ -1,8 +1,12 @@
 # shortlink-cloud · 高并发短链平台
 
+[![CI](https://github.com/OWNER/shortlink-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/shortlink-cloud/actions/workflows/ci.yml)
+
 > 短链生成 / 跳转 / 统计 / 限流 / 防刷 / 管理后台，一站式可一键启动的实现。
 >
 > **技术栈**：Java 17 · Spring Boot 3.3 · MyBatis-Plus · MySQL 8 · Redis 7 · Redisson · RabbitMQ · Sentinel · Flyway · Vue 3 · Element Plus · ECharts · Docker Compose · Nginx
+
+> ⚠️ **CI 徽章里的 `OWNER` 需要替换成你的 GitHub 用户名**，否则徽章会显示 404。
 
 ---
 
@@ -12,6 +16,7 @@
 - [快速开始](#快速开始)
 - [接口一览](#接口一览)
 - [项目结构](#项目结构)
+- [验证与测试](#验证与测试)
 - [压测报告](#压测报告)
 - [开发进度](#开发进度)
 - [环境说明](#环境说明)
@@ -280,6 +285,63 @@ shortlink-cloud/
 
 ---
 
+## 验证与测试
+
+> ⚠️ **重要前提**：本仓库的代码由 AI 在**无 Docker、无 HTTPS 出网**的沙箱中编写。
+> 因此 `mvn test`、`docker compose up`、`npm run build`、`wrk` 压测
+> **在交付时一次都没有执行过**。下面的方式是把"未验证"变成"已验证"的路径。
+
+### 方式一：GitHub Actions（推荐，无需本地装 Docker）
+
+推送到 GitHub 后，[`.github/workflows/ci.yml`](.github/workflows/ci.yml) 会自动执行：
+
+| Job | 内容 |
+| --- | --- |
+| `backend-unit` | 编译 + 10 个单元测试类 |
+| `backend-integration` | Testcontainers 启动真实 MySQL/Redis/RabbitMQ 跑集成测试 |
+| `backend-package` | 打包并校验 jar 产物 |
+| `frontend` | TypeScript 类型检查 + 生产构建 |
+| `docker-build` | 两个镜像构建 + compose 语法校验 |
+
+也可以不推送，直接在 GitHub 网页上手动触发（workflow 已配 `workflow_dispatch`）。
+
+### 方式二：本地一键验证脚本
+
+```powershell
+# Windows：完整验证（需要 JDK 17 + Maven + Node + Docker Desktop）
+pwsh -File scripts/verify.ps1
+
+# 没有 Docker 时跳过容器相关步骤
+pwsh -File scripts/verify.ps1 -SkipDocker
+```
+
+脚本逐步执行「工具链检查 → 后端单元测试 → 打包 → 前端类型检查与构建 →
+集成测试 → 端到端冒烟」，任一步失败即停止并给出排查方向。
+
+### 手动执行
+
+```bash
+# 单元测试（不需要中间件，最快）
+cd backend && mvn test
+
+# 集成测试（需要 Docker，会启动真实中间件容器）
+cd backend && mvn -Pintegration test
+
+# 前端类型检查与构建
+cd frontend && npm install && npm run type-check && npm run build
+```
+
+### 测试分层说明
+
+| 层级 | 数量 | 依赖 | 覆盖什么 |
+| --- | --- | --- | --- |
+| 单元测试 | 10 个类 | 无（全 mock） | 业务编排：发号重试、限流边界、UV 口径、缓存降级、攒批 ack 时机 |
+| 集成测试 | 2 个类 | Docker | SQL 语法、Flyway 迁移可执行性、JSON 序列化、唯一索引、真实 PV/UV 聚合 |
+
+**为什么两层都要**：单元测试验证不了 SQL 和迁移；集成测试跑得慢、不适合每次提交都跑。
+
+---
+
 ## 压测报告
 
 > 方法论、采集口径与实测结果见 [`docs/benchmark.md`](docs/benchmark.md)。
@@ -313,6 +375,16 @@ jmeter -n -t loadtest/jmeter/shortlink-redirect.jmx \
 分阶段任务、验收命令与**真实执行结果**记录在 [`docs/progress.md`](docs/progress.md)。
 每个阶段的验收命令是否真的跑通、哪些跑不通、原因是什么，都在那里如实标注，
 包括与任务书的技术选型偏差及其理由。
+
+## 面试与学习
+
+如果你用这个项目准备面试，[`docs/interview-guide.md`](docs/interview-guide.md) 把代码里的
+关键取舍翻译成了可以直接讲出来的答案，包括：
+
+- 9 个设计决策点的「怎么答」（302 vs 301、布隆过滤器预热、ack 时机、UV 去重、fail-open 等）
+- 被问「这个项目有什么不足」时的答法
+- 高频技术细节速查表
+- 现场演示的建议顺序
 
 ---
 

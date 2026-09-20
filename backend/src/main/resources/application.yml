@@ -145,6 +145,20 @@ shortlink:
     expire-seconds: ${JWT_EXPIRE_SECONDS:86400}
     header: Authorization
     prefix: "Bearer "
+  # 数据保留策略：t_link_access_log / t_link_uv_log 都是只增不删的表，
+  # 不配置清理最终会把磁盘写满
+  retention:
+    enabled: ${RETENTION_ENABLED:true}
+    # 访问明细保留天数
+    access-log-days: ${RETENTION_ACCESS_LOG_DAYS:90}
+    # UV 去重记录保留天数
+    uv-log-days: ${RETENTION_UV_LOG_DAYS:180}
+    # 单批删除行数（过大会造成主从延迟）
+    batch-size: 10000
+    # 单次调度最多删多少批，防止一次清理长时间占用数据库
+    max-batches-per-run: 50
+    # 每天 03:30 低峰期执行
+    cron: "0 30 3 * * ?"
 
 # ---------------- 监控 ----------------
 management:
