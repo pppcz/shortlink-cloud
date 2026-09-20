@@ -604,3 +604,66 @@ wrong iteration rejected: True
 | 前端类型检查 | ❌ 仍未执行 |
 | 推送到 GitHub | ❌ 实测仍被阻断（TLS `SEC_E_NO_CREDENTIALS`），代码尚未上传任何远端 |
 
+---
+
+## 第一次 CI 运行结果（真实执行记录）
+
+代码推送到 GitHub 后 CI 自动运行，**第 1 次运行编译失败**。
+这是本项目第一次获得真实的执行反馈，记录如下。
+
+### 失败内容
+
+```
+[ERROR] ShortLinkCacheManagerImpl.java:[92,22] method put in interface
+        org.redisson.api.RMap<K,V> cannot be applied to given types;
+  required: java.lang.String,java.lang.String
+  found:    java.lang.String,java.lang.String,long,java.util.concurrent.TimeUnit
+```
+
+同一处错误出现两次（正常缓存写入与空值标记写入）。
+
+### 根因
+
+我假设 Redisson 的 `RMap#put` 有带 TTL 的重载，实际上**没有**。
+原因是 Redis Hash 的过期时间只能设在 key 上，无法给单个 field 设 TTL——
+所以 `RMap` 根本不提供这个能力。要用带 TTL 的 field 必须用 `RMapCache`。
+
+**这是一个只有编译才能发现的错误**：单元测试全部 mock 掉 Mapper 与 Redis，
+`ShortLinkCacheManagerImpl` 也没有对应单元测试，所以 mock 层面永远测不出来。
+
+### 修复方式
+
+改用 **每个短码一个 `RBucket`**（key 形如 `sl:link:{shortCode}`），
+而不是一个 `RMap` 装所有短码。这个模型反而更贴合需求：
+
+| 维度 | RMap（原方案） | RBucket（修复后） |
+| --- | --- | --- |
+| 每条映射独立 TTL | ❌ 不支持 | ✅ 天然支持 |
+| 空值标记 | 需要第二个 key 空间 | ✅ 同一个 key，值为空串 |
+| 大 key / 热 key 风险 | 有（所有短码挤一个 Hash） | 无（单 key 操作） |
+| 排障可读性 | field 层级，需 hget | `GET sl:link:abc1234` 直接可读 |
+
+已用 `RBucket.set(V, Duration)`，该方法在 Redisson 3.32.0 中确认存在
+（对照官方源码 `org/redisson/api/RBucket.java` 核对过签名）。
+
+### 顺带发现并修掉的第二个问题
+
+核对 Testcontainers 1.20.3 的 `RabbitMQContainer` 源码时发现：
+`withUser()` / `withVhost()` 是 `@Deprecated` 实现，它们通过容器内执行
+`rabbitmqadmin` 来声明用户，而 `rabbitmq:3.13` 镜像**已经不提供
+`rabbitmqadmin`**，命令会静默失败（只打 error 日志），
+结果是"声明的账号根本不存在，应用连接时报认证失败"。
+
+改为使用容器默认的 `guest/guest`，并在 `@DynamicPropertySource` 里显式覆盖
+`spring.rabbitmq.virtual-host`。集成测试的目的是验证消息收发链路，不是验证账号配置。
+
+### 本次修复新增的测试
+
+新增 `DataRetentionServiceImplTest`（8 个用例），覆盖清理任务的分批循环：
+满批继续、不足批停止、单次上限约束、保留窗口计算、异常吞掉、开关关闭。
+这部分是纯算法，不需要容器；`DELETE ... LIMIT` 的真实语法仍由集成测试验证。
+
+### 仍未验证
+
+第 2 次 CI 运行结果待观察。**前端类型检查、集成测试、镜像构建都还没有成功跑过**。
+

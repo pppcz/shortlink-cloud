@@ -46,12 +46,21 @@ public abstract class AbstractIntegrationTest {
                     .withCommand("redis-server", "--requirepass", "redis123")
                     .withReuse(false);
 
-    /** RabbitMQ：管理版镜像，端口与生产一致。 */
+    /**
+     * RabbitMQ：管理版镜像，端口与生产一致。
+     *
+     * <p><b>刻意使用默认 guest/guest，而不是自定义账号</b>。
+     * 原因：Testcontainers 1.20 的 {@code withUser()} / {@code withVhost()} 是
+     * {@code @Deprecated} 实现——它们通过容器内执行 {@code rabbitmqadmin} 声明用户，
+     * 而 {@code rabbitmqadmin} 在 rabbitmq:3.13 镜像里已经不随镜像提供，
+     * 命令会静默失败（只打 error 日志），导致声明的用户根本不存在、
+     * 应用连接时报认证失败。
+     *
+     * <p>默认 guest 账号在容器内可用，简单可靠。生产环境当然不用 guest，
+     * 这里的目的是验证消息收发链路，不是验证账号配置。
+     */
     protected static final RabbitMQContainer RABBITMQ =
             new RabbitMQContainer(DockerImageName.parse("rabbitmq:3.13.7-management-alpine"))
-                    .withUser("shortlink")
-                    .withPassword("shortlink123")
-                    .withVhost("/")
                     .withReuse(false);
 
     static {
@@ -84,10 +93,12 @@ public abstract class AbstractIntegrationTest {
         registry.add("spring.data.redis.password", () -> "redis123");
 
         // ---- RabbitMQ ----
+        // 覆盖 base 配置里的 shortlink/shortlink123，改用容器默认的 guest/guest
         registry.add("spring.rabbitmq.host", RABBITMQ::getHost);
         registry.add("spring.rabbitmq.port", RABBITMQ::getAmqpPort);
         registry.add("spring.rabbitmq.username", RABBITMQ::getAdminUsername);
         registry.add("spring.rabbitmq.password", RABBITMQ::getAdminPassword);
+        registry.add("spring.rabbitmq.virtual-host", () -> "/");
 
         // ---- 测试期间放宽业务限制，避免用例之间互相干扰 ----
         // 限流单独在 RateLimitIntegrationTest 里用小阈值验证，其余用例不该被它挡住

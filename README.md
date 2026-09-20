@@ -1,12 +1,10 @@
 # shortlink-cloud · 高并发短链平台
 
-[![CI](https://github.com/OWNER/shortlink-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/shortlink-cloud/actions/workflows/ci.yml)
+[![CI](https://github.com/pppcz/shortlink-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/pppcz/shortlink-cloud/actions/workflows/ci.yml)
 
 > 短链生成 / 跳转 / 统计 / 限流 / 防刷 / 管理后台，一站式可一键启动的实现。
 >
 > **技术栈**：Java 17 · Spring Boot 3.3 · MyBatis-Plus · MySQL 8 · Redis 7 · Redisson · RabbitMQ · Sentinel · Flyway · Vue 3 · Element Plus · ECharts · Docker Compose · Nginx
-
-> ⚠️ **CI 徽章里的 `OWNER` 需要替换成你的 GitHub 用户名**，否则徽章会显示 404。
 
 ---
 
